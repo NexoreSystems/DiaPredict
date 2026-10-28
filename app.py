@@ -6,7 +6,7 @@ import time
 from functools import lru_cache
 from datetime import date
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Optional
 
 import joblib
@@ -15,6 +15,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL
@@ -25,6 +26,7 @@ try:  # .env необов'язковий: pip install python-dotenv
 except ImportError:
     pass
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dss")
 
 # Фікс для Windows/MIME-type
@@ -56,6 +58,8 @@ engine = create_engine(DATABASE_URL, pool_recycle=3600, pool_pre_ping=True,
                        pool_size=5, max_overflow=10)
 
 app = FastAPI(title="Endocrinology Decision Support System API")
+# JSON зі списком пацієнтів великий (МБ) — стискаємо, щоб він швидше доходив до браузера
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 class NoCacheStaticFiles(StaticFiles):
     """Браузер перевіряє файли при кожному запиті, тож зміни в JS підхоплюються одразу."""
@@ -116,6 +120,42 @@ def _num(value, default):
 def _table_columns() -> dict:
     """{'hba1c': 'HbA1c', ...} — реальні колонки таблиці (регістронезалежно)."""
     return {c["name"].lower(): c["name"] for c in inspect(engine).get_columns(TABLE)}
+
+
+# Назви колонок у БД можуть відрізнятися регістром/написанням — приводимо їх до тих, що очікує код.
+_COLUMN_ALIASES = {
+    "hba1c": "HbA1c", "hba1c_percent": "HbA1c", "a1c": "HbA1c",
+    "triglycerides": "triglycerides", "triglyceride": "triglycerides", "tg": "triglycerides",
+    "triglycerides_mgdl": "triglycerides", "triglycerides_mg_dl": "triglycerides",
+    "glucose_fasting": "glucose_fasting", "systolic_bp": "systolic_bp", "bmi": "bmi",
+    "age": "age", "sex": "sex", "dx_type2_diabetes": "dx_type2_diabetes",
+    "test_date": "test_date", "patient_id": "patient_id",
+}
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename = {}
+    for col in df.columns:
+        canon = _COLUMN_ALIASES.get(str(col).lower())
+        if canon and canon != col and canon not in df.columns:
+            rename[col] = canon
+    return df.rename(columns=rename) if rename else df
+
+
+def _last_valid(df: pd.DataFrame, col: str):
+    """Останнє непорожнє значення колонки (показник міг не вимірюватися на останньому візиті)."""
+    if col not in df.columns:
+        return None
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    return None if s.empty else float(s.iloc[-1])
+
+
+def _trig_to_mmol(raw):
+    """Тригліцериди в БД зберігаються в мг/дл (так записує форма введення).
+    Якщо значення схоже на ммоль/л (≤ 20) — додатково не конвертуємо."""
+    if raw is None:
+        return None
+    return raw if raw <= 20 else raw / TRIGLYCERIDES_MMOL_TO_MGDL
 
 
 def _features(latest: dict, defaults: dict) -> pd.DataFrame:
@@ -477,6 +517,7 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
         query = text(f"SELECT * FROM {TABLE} WHERE patient_id = :pid ORDER BY test_date ASC")
         with engine.connect() as conn:
             p_df = pd.read_sql(query, con=conn, params={"pid": patient_id})
+        p_df = _normalize_columns(p_df)
 
         if p_df.empty:
             raise HTTPException(status_code=404, detail="Пацієнта не знайдено")
@@ -488,15 +529,17 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
         risk_prob = float(t1_model.predict_proba(_features(latest, T1_DEFAULTS))[0][1]) if mode == "risk" else None
         predicted_hba1c = float(t2_model.predict(_features(latest, T2_DEFAULTS))[0])
 
-        hba1c_val = _num(latest.get("HbA1c"), 6.0)
+        missing_cols = [c for c in ("HbA1c", "triglycerides") if c not in p_df.columns]
+        if missing_cols:
+            logger.warning("У таблиці %s немає колонок %s. Наявні колонки: %s", TABLE, missing_cols, list(p_df.columns))
+        hba1c_val = _num(latest.get("HbA1c"), _last_valid(p_df, "HbA1c") or 6.0)
         prev_hba1c = _num(prev.get("HbA1c"), hba1c_val)
         glucose_mmol = _num(latest.get("glucose_fasting"), 100) / GLUCOSE_MMOL_TO_MGDL
         bmi_val = _num(latest.get("bmi"), 25)
         bp_val = _num(latest.get("systolic_bp"), 120)
         age_val = int(_num(latest.get("age"), 50))
-        trig_val = _num(latest.get("triglycerides"), 0)
-        trig_raw = _num(latest.get("triglycerides"), None)
-        trig_mmol_profile = None if trig_raw is None else round(trig_raw / TRIGLYCERIDES_MMOL_TO_MGDL, 2)
+        trig_mmol_real = _trig_to_mmol(_last_valid(p_df, "triglycerides"))  # None, якщо в БД немає значень
+        trig_mmol_profile = None if trig_mmol_real is None else round(trig_mmol_real, 2)
 
         key_fields = ("age", "glucose_fasting", "HbA1c", "bmi", "systolic_bp", "triglycerides")
         quality = round(100 * sum(_num(latest.get(k), None) is not None for k in key_fields) / len(key_fields))
@@ -515,7 +558,7 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
         if mode != "risk":  # для підтвердженого ЦД2 оцінюємо ускладнення, а не ймовірність діабету
             complication = _complication_assessment(
                 hba1c_val, prev_hba1c, glucose_mmol, bp_val, bmi_val,
-                trig_val / TRIGLYCERIDES_MMOL_TO_MGDL, age_val, predicted_hba1c,
+                trig_mmol_real or 0, age_val, predicted_hba1c,
                 glucose_trend if glucose_trend is not None else glucose_mmol,
                 bp_trend if bp_trend is not None else bp_val)
             risk_level, rec = complication["level"], complication["recommendation"]
@@ -573,8 +616,9 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
 
 
 # ───────────────────────── Прогноз для всіх пацієнтів ─────────────────────────
-COHORT_TTL_SEC = 120  # короткий кеш, щоб повторне відкриття панелі не перераховувало всю базу
+COHORT_TTL_SEC = 1800  # кеш на 30 хв; скидається при додаванні запису, кнопка "Перерахувати" оновлює вручну
 _cohort_cache: dict = {}
+_cohort_lock = Lock()  # паралельні запити не рахують те саме двічі
 _LEVEL_GROUPS = ("Низький", "Помірний", "Високий")
 
 
@@ -582,19 +626,48 @@ def _risk_group(level: str) -> str:
     return "Високий" if "Високий" in level else "Помірний" if "Помірний" in level else "Низький"
 
 
+_COHORT_COLS = {"patient_id", "test_date", "age", "sex", "HbA1c", "glucose_fasting",
+                "bmi", "systolic_bp", "triglycerides"}
+
+
+def _load_cohort_df(conn, mode: str) -> pd.DataFrame:
+    """Читаємо лише потрібні колонки (а не SELECT * по 180 тис. рядків)."""
+    real = [r for low, r in _table_columns().items() if _COLUMN_ALIASES.get(low) in _COHORT_COLS]
+    cols = ", ".join(f"`{c}`" for c in real) or "*"
+    return pd.read_sql(text(f"SELECT {cols} FROM {TABLE} WHERE dx_type2_diabetes = :dx"),
+                       con=conn, params={"dx": 0 if mode == "risk" else 1})
+
+
+def _cached_cohort(mode: str):
+    cached = _cohort_cache.get(mode)
+    if cached and time.time() - cached[0] < COHORT_TTL_SEC:
+        return cached[1]
+    return None
+
+
 @app.get("/api/forecast/all")
 def forecast_all_patients(mode: str = "risk", refresh: bool = False):
     """Прогноз HbA1c (Tier 2) та ризику для всіх пацієнтів вкладки — за останнім візитом кожного."""
     if mode not in ("risk", "complication"):
         raise HTTPException(422, "mode: допустимі значення risk або complication")
-    cached = _cohort_cache.get(mode)
-    if cached and not refresh and time.time() - cached[0] < COHORT_TTL_SEC:
-        return cached[1]
+    if not refresh:
+        hit = _cached_cohort(mode)
+        if hit is not None:
+            return hit
+    with _cohort_lock:
+        if not refresh:  # поки чекали на lock, інший запит (або прогрів) міг уже порахувати
+            hit = _cached_cohort(mode)
+            if hit is not None:
+                return hit
+        return _compute_cohort(mode)
 
+
+def _compute_cohort(mode: str):
     try:
+        started = time.time()
         with engine.connect() as conn:
-            df = pd.read_sql(text(f"SELECT * FROM {TABLE} WHERE dx_type2_diabetes = :dx"),
-                             con=conn, params={"dx": 0 if mode == "risk" else 1})
+            df = _load_cohort_df(conn, mode)
+        df = _normalize_columns(df)
 
         if df.empty:
             result = {"mode": mode, "total": 0, "patients": [],
@@ -603,46 +676,75 @@ def forecast_all_patients(mode: str = "risk", refresh: bool = False):
             _cohort_cache[mode] = (time.time(), result)
             return result
 
+        for col in ("age", "HbA1c", "glucose_fasting", "bmi", "systolic_bp", "triglycerides"):
+            df[col] = pd.to_numeric(df[col], errors="coerce") if col in df.columns else np.nan
+        if "sex" not in df.columns:
+            df["sex"] = None
+        df["patient_id"] = df["patient_id"].astype(str)
         df = df.sort_values("test_date", kind="stable")
-        groups = [(str(pid), g) for pid, g in df.groupby("patient_id", sort=False)]
-        latest = [g.iloc[-1].to_dict() for _, g in groups]
-        previous = [g.iloc[-2].to_dict() if len(g) > 1 else cur for (_, g), cur in zip(groups, latest)]
 
-        # Моделі викликаються один раз для всієї вибірки, а не по пацієнту
-        x2 = pd.DataFrame([{k: _num(r.get(k), d) for k, d in T2_DEFAULTS.items()} for r in latest])
+        # Усе рахуємо векторно по всій вибірці, без циклу pandas-операцій по кожному пацієнту
+        grp = df.groupby("patient_id", sort=False)
+        back = grp.cumcount(ascending=False)          # 0 = останній візит, 1 = передостанній
+        latest = df[back == 0].set_index("patient_id")
+        ids = latest.index
+        prev = df[back == 1].set_index("patient_id").reindex(ids)
+        visits = grp.size().reindex(ids).to_numpy()
+        last_hba1c = grp["HbA1c"].last().reindex(ids)             # останнє непорожнє значення
+        last_trig = grp["triglycerides"].last().reindex(ids)
+
+        fallback = last_hba1c.where(last_hba1c.notna() & (last_hba1c != 0), 6.0)
+        hba1c_s = latest["HbA1c"].fillna(fallback)
+        prev_hba1c_s = prev["HbA1c"].fillna(hba1c_s)
+
+        x2 = pd.DataFrame({k: latest[k].fillna(d).astype(float) for k, d in T2_DEFAULTS.items()})
         predicted = t2_model.predict(x2)
         probs = None
         if mode == "risk":
-            x1 = pd.DataFrame([{k: _num(r.get(k), d) for k, d in T1_DEFAULTS.items()} for r in latest])
+            x1 = pd.DataFrame({k: latest[k].fillna(d).astype(float) for k, d in T1_DEFAULTS.items()})
             probs = t1_model.predict_proba(x1)[:, 1]
+        else:
+            tail = df[back < 8]  # тренд рахується за останніми 8 візитами
+            g_trend = {pid: _trend_forecast(v / GLUCOSE_MMOL_TO_MGDL)
+                       for pid, v in tail.groupby("patient_id", sort=False)["glucose_fasting"]}
+            bp_trend = {pid: _trend_forecast(v)
+                        for pid, v in tail.groupby("patient_id", sort=False)["systolic_bp"]}
+
+        hba1c_a = hba1c_s.to_numpy(dtype=float)
+        prev_a = prev_hba1c_s.to_numpy(dtype=float)
+        glucose_a = latest["glucose_fasting"].fillna(100).to_numpy(dtype=float) / GLUCOSE_MMOL_TO_MGDL
+        bp_a = latest["systolic_bp"].fillna(120).to_numpy(dtype=float)
+        bmi_a = latest["bmi"].fillna(25).to_numpy(dtype=float)
+        age_a = latest["age"].fillna(50).to_numpy(dtype=float)
+        trig_a = last_trig.to_numpy(dtype=float)
+        sex_a = latest["sex"].tolist()
 
         rows = []
-        for i, ((pid, g), cur, prev) in enumerate(zip(groups, latest, previous)):
-            hba1c = _num(cur.get("HbA1c"), 6.0)
-            glucose = _num(cur.get("glucose_fasting"), 100) / GLUCOSE_MMOL_TO_MGDL
+        for i, pid in enumerate(ids):
+            hba1c = float(hba1c_a[i])
+            glucose = float(glucose_a[i])
             forecast = float(predicted[i])
 
             if mode == "risk":
                 level, _ = _risk_assessment(float(probs[i]), hba1c, glucose)
                 risk, risk_forecast = float(probs[i]) * 100, None
             else:
-                tail = g.tail(8)
-                g_trend = _trend_forecast(tail["glucose_fasting"] / GLUCOSE_MMOL_TO_MGDL)
-                bp = _num(cur.get("systolic_bp"), 120)
-                bp_trend = _trend_forecast(tail["systolic_bp"])
+                bp = float(bp_a[i])
+                gt, bt = g_trend.get(pid), bp_trend.get(pid)
+                trig = None if np.isnan(trig_a[i]) else float(trig_a[i])
                 comp = _complication_assessment(
-                    hba1c, _num(prev.get("HbA1c"), hba1c), glucose, bp, _num(cur.get("bmi"), 25),
-                    _num(cur.get("triglycerides"), 0) / TRIGLYCERIDES_MMOL_TO_MGDL,
-                    int(_num(cur.get("age"), 50)), forecast,
-                    g_trend if g_trend is not None else glucose,
-                    bp_trend if bp_trend is not None else bp)
+                    hba1c, float(prev_a[i]), glucose, bp, float(bmi_a[i]),
+                    _trig_to_mmol(trig) or 0, int(age_a[i]), forecast,
+                    gt if gt is not None else glucose,
+                    bt if bt is not None else bp)
                 level, risk, risk_forecast = comp["level"], float(comp["score"]), float(comp["forecast_score"])
 
+            sex = sex_a[i]
             rows.append({
                 "patient_id": pid,
-                "age": int(_num(cur.get("age"), 50)),
-                "sex": "M" if pd.isna(cur.get("sex")) else str(cur.get("sex")),
-                "visits": int(len(g)),
+                "age": int(age_a[i]),
+                "sex": "M" if pd.isna(sex) else str(sex),
+                "visits": int(visits[i]),
                 "hba1c": round(hba1c, 2),
                 "forecast_hba1c": round(forecast, 2),
                 "delta": round(forecast - hba1c, 2),
@@ -652,7 +754,9 @@ def forecast_all_patients(mode: str = "risk", refresh: bool = False):
                 "group": _risk_group(level),
             })
 
-        rows.sort(key=lambda r: r["risk"], reverse=True)
+        # Спочатку за рівнем (лабораторні критерії можуть підвищити рівень над ML-відсотком), потім за відсотком
+        rank = {"Високий": 2, "Помірний": 1, "Низький": 0}
+        rows.sort(key=lambda r: (rank[r["group"]], r["risk"]), reverse=True)
         n = len(rows)
         result = {
             "mode": mode,
@@ -666,6 +770,7 @@ def forecast_all_patients(mode: str = "risk", refresh: bool = False):
             },
             "patients": rows,
         }
+        logger.info("forecast all (%s): %d пацієнтів за %.1f с", mode, n, time.time() - started)
         _cohort_cache[mode] = (time.time(), result)
         return result
     except HTTPException:
@@ -673,3 +778,18 @@ def forecast_all_patients(mode: str = "risk", refresh: bool = False):
     except Exception as e:
         logger.exception("forecast all")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _warm_cohort_cache():
+    """Прогріваємо кеш одразу після старту, щоб перше відкриття панелі не чекало розрахунку."""
+    for m in ("risk", "complication"):
+        try:
+            with _cohort_lock:
+                _compute_cohort(m)
+        except Exception:
+            logger.exception("прогрів кешу (%s)", m)
+
+
+@app.on_event("startup")
+def _startup_warmup():
+    Thread(target=_warm_cohort_cache, daemon=True).start()

@@ -32,6 +32,11 @@ export const fetchPatients = (mode, query = '') =>
     getJson(`/api/patients?mode=${encodeURIComponent(mode)}&q=${encodeURIComponent(query)}`,
         'Помилка завантаження списку пацієнтів');
 
+// Прогноз HbA1c і ризику для всіх пацієнтів вкладки (mode: risk | complication)
+export const fetchCohortForecast = (mode, refresh = false) =>
+    getJson(`/api/forecast/all?mode=${encodeURIComponent(mode)}&refresh=${refresh}`,
+        'Помилка розрахунку прогнозу для всіх пацієнтів');
+
 export const fetchAllLabPatients = () =>
     getJson('/api/patients/all', 'Помилка завантаження бази для лаборанта');
 

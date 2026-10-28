@@ -18,7 +18,11 @@ const CHART_CONFIG = {
         forecastLabel: 'Прогноз HbA1c (ML Tier 2)',
         forecast: d => (d.ml_predictions ? d.ml_predictions.predicted_hba1c : null),
         refs: [{ value: 6.5, label: 'Поріг діабету (6.5%)', color: '#dc3545' },
-            { value: 5.7, label: 'Предіабет (5.7%)', color: '#e0a800' }
+            { value: 5.7, label: 'Норма до 5.7%', color: '#198754' }
+        ],
+        // Для пацієнта з ЦД2 орієнтир — цільові значення, а не діагностичні пороги
+        refsDiabetic: [{ value: 7.0, label: 'Ціль при ЦД2 (< 7%)', color: '#198754' },
+            { value: 8.0, label: 'Декомпенсація (≥ 8%)', color: '#dc3545' }
         ]
     },
     glucose: {
@@ -30,8 +34,11 @@ const CHART_CONFIG = {
         axisTitle: 'Глюкоза (ммоль/л)',
         forecastLabel: 'Прогноз глюкози (лінійний тренд)',
         forecast: d => forecastOf(d, 'glucose_fasting'),
-        refs: [{ value: 7.0, label: 'Діабет (7.0)', color: '#dc3545' },
+        refs: [{ value: 7.0, label: 'Діабет (≥ 7.0)', color: '#dc3545' },
             { value: 5.6, label: 'Норма до 5.6', color: '#198754' }
+        ],
+        refsDiabetic: [{ value: 7.2, label: 'Ціль при ЦД2 (до 7.2)', color: '#198754' },
+            { value: 10, label: 'Значно вище цілі (10)', color: '#dc3545' }
         ]
     },
     bp: {
@@ -98,7 +105,8 @@ function draw() {
         });
     }
 
-    cfg.refs.forEach(ref => datasets.push({
+    const refs = (lastData.is_diabetic && cfg.refsDiabetic) || cfg.refs;
+    refs.forEach(ref => datasets.push({
         label: ref.label,
         data: labels.map(() => ref.value),
         borderColor: ref.color,
