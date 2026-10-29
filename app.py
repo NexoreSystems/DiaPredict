@@ -74,12 +74,31 @@ js_dir = BASE_DIR / "js"
 if js_dir.exists():
     app.mount("/js", NoCacheStaticFiles(directory=js_dir), name="js")
 
-t1_model = joblib.load(BASE_DIR / "tier1_diabetes_risk.joblib")
-t2_model = joblib.load(BASE_DIR / "tier2_hba1c_forecast.joblib")
+t1_model = joblib.load(BASE_DIR / "tier1_diabetes_risk.joblib")      # v1 (резервна)
+t2_model = joblib.load(BASE_DIR / "tier2_hba1c_forecast.joblib")     # v1 (резервна)
+
+
+def _load_bundle(name: str):
+    """Моделі другої версії (train_models_v2.py). Якщо файлу немає — працюють моделі v1."""
+    path = BASE_DIR / name
+    return joblib.load(path) if path.exists() else None
+
+
+t1_v2 = _load_bundle("tier1_v2.joblib")
+t2_v2 = _load_bundle("tier2_v2.joblib")
+logger.info("Tier 1: %s | Tier 2: %s",
+            f"v2 ({t1_v2['name']})" if t1_v2 else "v1",
+            f"v2 ({t2_v2['name']})" if t2_v2 else "v1")
 
 T1_DEFAULTS = {"age": 50, "glucose_fasting": 100, "HbA1c": 6.0,
                "bmi": 25, "systolic_bp": 120, "triglycerides": 150}
 T2_DEFAULTS = {"HbA1c": 6.0, "glucose_fasting": 100, "bmi": 25, "age": 50}
+T1_BASE = list(T1_DEFAULTS)
+
+# Межі категорій ризику для Tier 1. У v2 нижня межа — скринінговий поріг (Recall ≥ 80%),
+# верхня — 0.5 (на тесті Precision ≈ 96%).
+RISK_LOW = t1_v2["thresholds"]["screening"] if t1_v2 else 0.3
+RISK_HIGH = 0.5 if t1_v2 else 0.6
 
 
 class LabRecordInput(BaseModel):
@@ -160,6 +179,49 @@ def _trig_to_mmol(raw):
 
 def _features(latest: dict, defaults: dict) -> pd.DataFrame:
     return pd.DataFrame([{k: _num(latest.get(k), d) for k, d in defaults.items()}])
+
+
+def _t1_proba(frame: pd.DataFrame) -> np.ndarray:
+    """Ймовірність діабету (Tier 1). frame — рядки з колонками age, glucose_fasting, HbA1c,
+    bmi, systolic_bp, triglycerides (останній візит кожного пацієнта)."""
+    if t1_v2 is None:
+        x = pd.DataFrame({k: (pd.to_numeric(frame[k], errors="coerce") if k in frame.columns
+                              else pd.Series(np.nan, index=frame.index)).fillna(d).astype(float)
+                          for k, d in T1_DEFAULTS.items()})
+        return t1_model.predict_proba(x)[:, 1]
+    x = pd.DataFrame({k: (pd.to_numeric(frame[k], errors="coerce").astype(float) if k in frame.columns
+                          else pd.Series(np.nan, index=frame.index)) for k in T1_BASE})
+    x["tg_missing"] = x["triglycerides"].isna().astype(int)  # як у train_models_v2.py; пропуски заповнює сам pipeline
+    return t1_v2["model"].predict_proba(x[t1_v2["features"]])[:, 1]
+
+
+def _t2_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Ознаки Tier 2 v2 для кожного візиту (історія пацієнта) — ті самі, що в train_models_v2.py.
+    Рядки кожного пацієнта мають іти в хронологічному порядку."""
+    d = pd.DataFrame(index=df.index)
+    d["patient_id"] = df["patient_id"].astype(str)
+    for col, default in (("HbA1c", 6.0), ("glucose_fasting", 100.0), ("bmi", 25.0), ("age", 50.0)):
+        d[col] = pd.to_numeric(df[col], errors="coerce").fillna(default) if col in df.columns else default
+    d["systolic_bp"] = pd.to_numeric(df["systolic_bp"], errors="coerce") if "systolic_bp" in df.columns else np.nan
+    dates = pd.to_datetime(df["test_date"], errors="coerce")
+    g = d.groupby("patient_id", sort=False)
+    prev, prev2 = g["HbA1c"].shift(1), g["HbA1c"].shift(2)
+    d["visit_index"] = g.cumcount()
+    d["has_prev"] = prev.notna().astype(int)
+    d["hba1c_delta1"] = (d["HbA1c"] - prev).fillna(0.0)
+    d["hba1c_delta2"] = (prev - prev2).fillna(0.0)
+    d["hba1c_hist_mean"] = g["HbA1c"].cumsum() / (d["visit_index"] + 1)
+    d["glucose_delta1"] = (d["glucose_fasting"] - g["glucose_fasting"].shift(1)).fillna(0.0)
+    d["days_since_prev"] = dates.groupby(d["patient_id"], sort=False).diff().dt.days.fillna(0.0)
+    return d
+
+
+def _t2_predict(feat: pd.DataFrame) -> np.ndarray:
+    """Прогноз HbA1c на наступний візит за ознаками з _t2_features."""
+    if t2_v2 is None:
+        return t2_model.predict(feat[list(T2_DEFAULTS)])
+    pred = t2_v2["model"].predict(feat[t2_v2["features"]])
+    return pred + feat["HbA1c"].to_numpy() if t2_v2.get("mode") == "delta" else pred
 
 
 LIFESTYLE_TABLE = "patient_lifestyle"
@@ -283,9 +345,9 @@ def _risk_assessment(risk_prob: float, hba1c: float, glucose_mmol: float):
     if hba1c >= 6.5 or glucose_mmol >= 7.0:
         return ("Високий ризик (лабораторні ознаки ЦД)",
                 "Показники в діапазоні діабету: потрібне підтверджувальне обстеження та консультація ендокринолога.")
-    if risk_prob < 0.3:
+    if risk_prob < RISK_LOW:
         return "Низький ризик", "Показники в межах норми."
-    if risk_prob < 0.6:
+    if risk_prob < RISK_HIGH:
         return "Помірний ризик", "Модифікація способу життя."
     return "Високий ризик", "Високий ризик розвитку діабету!"
 
@@ -526,8 +588,8 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
         prev = p_df.iloc[-2].to_dict() if len(p_df) > 1 else latest
 
         # Tier 1 навчена на скринінгу — для пацієнтів із ЦД2 (модуль 2) не застосовується
-        risk_prob = float(t1_model.predict_proba(_features(latest, T1_DEFAULTS))[0][1]) if mode == "risk" else None
-        predicted_hba1c = float(t2_model.predict(_features(latest, T2_DEFAULTS))[0])
+        risk_prob = float(_t1_proba(pd.DataFrame([latest]))[0]) if mode == "risk" else None
+        predicted_hba1c = float(_t2_predict(_t2_features(p_df).iloc[[-1]])[0])
 
         missing_cols = [c for c in ("HbA1c", "triglycerides") if c not in p_df.columns]
         if missing_cols:
@@ -598,6 +660,7 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
                 "risk_score": complication["score"] if complication else round(risk_prob * 100, 2),
                 "risk_level": risk_level,
                 "predicted_hba1c": round(predicted_hba1c, 2),
+                "model_version": "v2" if (t1_v2 or t2_v2) else "v1",
                 "recommendation": rec,
                 "complication": complication,
             },
@@ -697,12 +760,11 @@ def _compute_cohort(mode: str):
         hba1c_s = latest["HbA1c"].fillna(fallback)
         prev_hba1c_s = prev["HbA1c"].fillna(hba1c_s)
 
-        x2 = pd.DataFrame({k: latest[k].fillna(d).astype(float) for k, d in T2_DEFAULTS.items()})
-        predicted = t2_model.predict(x2)
+        # Ознаки Tier 2 враховують історію візитів, тому рахуємо їх по всій вибірці й беремо останній візит
+        predicted = _t2_predict(_t2_features(df)[(back == 0).to_numpy()])
         probs = None
         if mode == "risk":
-            x1 = pd.DataFrame({k: latest[k].fillna(d).astype(float) for k, d in T1_DEFAULTS.items()})
-            probs = t1_model.predict_proba(x1)[:, 1]
+            probs = _t1_proba(latest)
         else:
             tail = df[back < 8]  # тренд рахується за останніми 8 візитами
             g_trend = {pid: _trend_forecast(v / GLUCOSE_MMOL_TO_MGDL)
