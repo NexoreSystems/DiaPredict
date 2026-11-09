@@ -1,48 +1,56 @@
+"""Create a separate clean MySQL table from observed source measurements.
+
+The legacy patient_records table is deliberately left untouched.
+"""
 import os
-import pandas as pd
-from sqlalchemy import create_engine
+from pathlib import Path
+
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import URL
 from dotenv import load_dotenv
 
-load_dotenv()
+from build_master_dataset import build_master_dataset
 
-# 🔑 Налаштування підключення до MySQL
-MYSQL_USER = "root"
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
-MYSQL_HOST = "localhost"
-MYSQL_PORT = "3306"
-MYSQL_DB = "diabetes_db"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(BASE_DIR) if os.path.basename(BASE_DIR) == 'data_prep' else BASE_DIR
-csv_path = os.path.join(ROOT_DIR, "diabetes_master_longitudinal.csv")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+TARGET_TABLE = "patient_records_observed"
 
-def migrate():
-    if not os.path.exists(csv_path):
-        print(f"❌ Файл {csv_path} не знайдено!")
+
+def migrate() -> None:
+    password = os.getenv("MYSQL_PASSWORD")
+    if password is None:
+        raise RuntimeError("MYSQL_PASSWORD is not configured in the project .env file.")
+
+    url = URL.create(
+        "mysql+pymysql",
+        username=os.getenv("MYSQL_USER", "root"),
+        password=password,
+        host=os.getenv("MYSQL_HOST", "localhost"),
+        port=int(os.getenv("MYSQL_PORT", "3306")),
+        database=os.getenv("MYSQL_DB", "diabetes_db"),
+    )
+    engine = create_engine(url, pool_pre_ping=True)
+    if inspect(engine).has_table(TARGET_TABLE):
+        index_names = {item["name"] for item in inspect(engine).get_indexes(TARGET_TABLE)}
+        expected_index = f"idx_{TARGET_TABLE}_patient_date"
+        if expected_index not in index_names:
+            with engine.begin() as connection:
+                connection.execute(text(
+                    f"CREATE INDEX {expected_index} ON {TARGET_TABLE} (patient_id(32), test_date)"
+                ))
+        print(f"{TARGET_TABLE} already exists; data was not overwritten. Index is ready.")
         return
 
-    print("⏳ Читання CSV-файлу...")
-    df = pd.read_csv(csv_path)
+    print("Building observed encounter records from the raw dataset...")
+    frame = build_master_dataset()
+    print(f"Creating new table {TARGET_TABLE} ({len(frame):,} encounters)...")
+    frame.to_sql(TARGET_TABLE, con=engine, if_exists="fail", index=False, chunksize=10_000)
+    with engine.begin() as connection:
+        connection.execute(text(
+            f"CREATE INDEX idx_{TARGET_TABLE}_patient_date ON {TARGET_TABLE} (patient_id(32), test_date)"
+        ))
+    print(f"Created {TARGET_TABLE}. The legacy patient_records table was not changed.")
 
-    if 'diastolic_bp' not in df.columns:
-        df['diastolic_bp'] = 80.0
-    if 'triglycerides' not in df.columns:
-        df['triglycerides'] = 150.0
-
-    print("⏳ Підключення до MySQL та імпорт даних...")
-    connection_string = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
-    engine = create_engine(connection_string)
-
-    df.to_sql('patient_records', con=engine, if_exists='replace', index=False)
-
-    print("⏳ Створення індексу для прискорення пошуку...")
-    with engine.connect() as conn:
-        try:
-            conn.execute("CREATE INDEX idx_patient_id ON patient_records(patient_id);")
-        except Exception as e:
-            print("Примітка щодо індексу:", e)
-
-    print(f"✅ Успішно перенесено {len(df)} записів у MySQL базу `{MYSQL_DB}`!")
 
 if __name__ == "__main__":
     migrate()

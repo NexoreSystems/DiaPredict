@@ -127,6 +127,11 @@ export async function handleLabSubmit(e) {
         alert('Будь ласка, оберіть або згенеруйте ID пацієнта!');
         return;
     }
+    const triglycerides = parseFloat($('labTriglycerides').value);
+    if (!Number.isFinite(triglycerides) || triglycerides <= 0) {
+        showAlert('danger', 'Для прогнозу введіть фактичний результат аналізу на тригліцериди.');
+        return;
+    }
 
     const payload = {
         patient_mode: (document.querySelector('input[name="labPatientMode"]:checked') || {}).value || 'existing',
@@ -140,7 +145,7 @@ export async function handleLabSubmit(e) {
         bmi: parseFloat($('labBmi').value),
         systolic_bp: parseFloat($('labBpSystolic').value),
         diastolic_bp: numberOr('labBpDiastolic', 80),
-        triglycerides: numberOr('labTriglycerides', 1.7),
+        triglycerides,
         smoking: $('labSmoking').value || null,
         alcohol: $('labAlcohol').value || null,
         family_history: $('labFamily').value || null

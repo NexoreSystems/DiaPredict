@@ -1,4 +1,4 @@
-const FORECAST_LABEL = 'ПРОГНОЗ';
+const forecastLabelFor = (data) => data.next_visit_date ? `Візит ${data.next_visit_date}` : 'ПРОГНОЗ';
 let chart = null;
 let lastData = null;
 let current = 'hba1c';
@@ -41,19 +41,6 @@ const CHART_CONFIG = {
             { value: 10, label: 'Значно вище цілі (10)', color: '#dc3545' }
         ]
     },
-    bp: {
-        field: 'systolic_bp',
-        label: 'Систолічний АТ (мм рт.ст.)',
-        unit: ' мм рт.ст.',
-        color: '#dc3545',
-        fill: 'rgba(220, 53, 69, 0.12)',
-        axisTitle: 'АТ (мм рт.ст.)',
-        forecastLabel: 'Прогноз АТ (лінійний тренд)',
-        forecast: d => forecastOf(d, 'systolic_bp'),
-        refs: [{ value: 140, label: 'Гіпертензія (140)', color: '#dc3545' },
-            { value: 130, label: 'Норма до 130', color: '#198754' }
-        ]
-    }
 };
 
 function draw() {
@@ -69,7 +56,7 @@ function draw() {
     const lastIdx = values.reduce((acc, v, i) => (v !== null ? i : acc), -1);
     const forecast = lastIdx >= 0 ? cfg.forecast(lastData) : null;
     const hasForecast = forecast !== null && forecast !== undefined && !Number.isNaN(forecast);
-    if (hasForecast) labels.push(FORECAST_LABEL);
+    if (hasForecast) labels.push(forecastLabelFor(lastData));
 
     const datasets = [{
         label: cfg.label,
@@ -79,7 +66,7 @@ function draw() {
         borderWidth: 3,
         tension: 0.3,
         fill: true,
-        spanGaps: true,
+        spanGaps: false,
         pointRadius: 4,
         pointHoverRadius: 6,
         pointBackgroundColor: cfg.color,
@@ -145,7 +132,7 @@ function markActiveTab() {
         b.classList.toggle('active', b.dataset.chart === current));
 }
 
-// Перемикання показника на графіку (HbA1c / глюкоза / АТ)
+// Перемикання показника на графіку (лише датовані лабораторні вимірювання)
 export function switchChart(key) {
     if (!CHART_CONFIG[key]) return;
     current = key;

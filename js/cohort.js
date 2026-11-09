@@ -4,9 +4,9 @@ const $ = (id) => document.getElementById(id);
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g,
     c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-const GROUPS = ['Низький', 'Помірний', 'Високий'];
-const COLORS = { 'Низький': '#198754', 'Помірний': '#e0a800', 'Високий': '#dc3545' };
-const BADGE = { 'Низький': 'bg-success', 'Помірний': 'bg-warning text-dark', 'Високий': 'bg-danger' };
+const GROUPS = ['Низький', 'Помірний', 'Високий', 'Недостатньо даних', 'Модель не пройшла перевірку'];
+const COLORS = { 'Низький': '#198754', 'Помірний': '#e0a800', 'Високий': '#dc3545', 'Недостатньо даних': '#6c757d', 'Модель не пройшла перевірку': '#495057' };
+const BADGE = { 'Низький': 'bg-success', 'Помірний': 'bg-warning text-dark', 'Високий': 'bg-danger', 'Недостатньо даних': 'bg-secondary', 'Модель не пройшла перевірку': 'bg-secondary' };
 const PAGE = 20;
 const MAX_POINTS_PER_GROUP = 3000;
 
@@ -57,12 +57,12 @@ export async function openCohort(m) {
     $('cohortPanel').style.display = 'block';
     $('cohortBtn').innerHTML = btnHtml(true);
     $('cohortTitle').textContent = mode === 'risk' ?
-        'Прогноз для всіх пацієнтів скринінгу (без ЦД)' :
+        'Прогноз появи ЦД2 до наступного візиту (повні аналізи)' :
         'Прогноз для всіх пацієнтів з ЦД 2 типу';
     $('thCohortHba1c').innerHTML = 'HbA1c зараз' + `<span class="norm">${mode === 'risk' ? 'норма &lt; 5.7%' : 'ціль &lt; 7%'}</span>`;
     $('thCohortRisk').innerHTML = mode === 'risk' ?
-        'Ризик діабету, %' :
-        'Ризик ускладнень, % <span class="norm">зараз → прогноз</span>';
+        'Tier 1: поява запису про ЦД2 до візиту, %' :
+        'Індекс судинного ризику, % <span class="norm">зараз → сценарій</span>';
     $('normCohortMean').textContent = mode === 'risk' ? 'Норма HbA1c < 5.7%' : 'Ціль HbA1c при ЦД2 < 7%';
     $('cohortFilter').value = '';
     shown = PAGE;
@@ -99,7 +99,19 @@ function render() {
     $('cohortTotal').textContent = data.total;
     $('cohortMean').textContent = data.total ? `${s.mean_hba1c}% → ${s.mean_forecast_hba1c}%` : '—';
     $('cohortWorse').textContent = `${s.worsening} (${pct(s.worsening)}%)`;
-    $('cohortHigh').textContent = `${s.levels['Високий']} (${pct(s.levels['Високий'])}%)`;
+    const highLabel = $('cohortHighLabel');
+    if (mode === 'risk') {
+        const threshold = Number(s.tier1_threshold ?? 0);
+        if (highLabel) highLabel.textContent = `Tier 1 понад порогом ${threshold}%`;
+        $('cohortHigh').textContent = `${s.tier1_alerts || 0} (${pct(s.tier1_alerts || 0)}%)`;
+        const riskHeading = $('thCohortRisk');
+        if (riskHeading && data.risk_model_auc != null && Number(data.risk_model_auc) < 0.60) {
+            riskHeading.textContent = `Tier 1: поява запису про ЦД2 до візиту, % · часова AUC ${Number(data.risk_model_auc).toFixed(2)}`;
+        }
+    } else {
+        if (highLabel) highLabel.textContent = 'Високий індекс судинного ризику';
+        $('cohortHigh').textContent = `${s.levels['Високий']} (${pct(s.levels['Високий'])}%)`;
+    }
     renderCharts();
     renderTable();
 }
@@ -189,17 +201,20 @@ function renderTable() {
     const rows = filteredRows();
     $('cohortBody').innerHTML = rows.slice(0, shown).map(p => {
         const dCls = p.delta > 0.2 ? 'text-danger fw-bold' : p.delta < -0.2 ? 'text-success fw-bold' : '';
-        const risk = p.risk_forecast != null ? `${p.risk}% → ${p.risk_forecast}%` : `${p.risk}%`;
+        const suffix = '%';
+        const risk = p.risk == null ? '—' : p.risk_forecast != null
+            ? `${p.risk}${suffix} → ${p.risk_forecast}${suffix}` : `${p.risk}${suffix}`;
         return `<tr class="cohort-row" data-id="${escapeHtml(p.patient_id)}">
             <td class="fw-bold text-blue">${escapeHtml(p.patient_id)}</td>
             <td>${p.age} р, ${escapeHtml(p.sex)}</td>
             <td>${p.hba1c}%</td>
             <td class="text-primary fw-bold">${p.forecast_hba1c}%</td>
+            <td>${escapeHtml(p.next_visit_date)}</td>
             <td class="${dCls}">${p.delta > 0 ? '+' : ''}${p.delta}</td>
             <td>${risk}</td>
             <td><span class="badge ${BADGE[p.group]}">${escapeHtml(p.group)}</span></td>
         </tr>`;
-    }).join('') || '<tr><td colspan="7" class="text-center text-muted">Нічого не знайдено</td></tr>';
+    }).join('') || '<tr><td colspan="8" class="text-center text-muted">Нічого не знайдено</td></tr>';
 
     const more = $('cohortMore');
     const left = rows.length - shown;
@@ -209,9 +224,12 @@ function renderTable() {
 
 function exportCsv() {
     if (!data || !data.patients.length) return;
-    const head = ['patient_id', 'age', 'sex', 'visits', 'hba1c', 'forecast_hba1c', 'delta', 'risk_percent', 'risk_forecast_percent', 'level'];
-    const lines = data.patients.map(p => [p.patient_id, p.age, p.sex, p.visits, p.hba1c, p.forecast_hba1c,
-        p.delta, p.risk, (p.risk_forecast == null ? '' : p.risk_forecast), p.level
+    const head = ['patient_id', 'age', 'sex', 'visits', 'next_visit_date', 'days_to_next_visit', 'hba1c', 'forecast_hba1c', 'delta',
+        mode === 'risk' ? 't2d_record_probability_percent' : 'vascular_risk_index_percent',
+        mode === 'risk' ? 'forecast_t2d_record_probability_percent' : 'forecast_vascular_risk_index_percent',
+        'tier1_probability_percent', 'level'];
+    const lines = data.patients.map(p => [p.patient_id, p.age, p.sex, p.visits, p.next_visit_date, p.days_to_next_visit, p.hba1c, p.forecast_hba1c,
+        p.delta, p.risk, (p.risk_forecast == null ? '' : p.risk_forecast), p.tier1_probability, p.level
     ].join(';'));
     const blob = new Blob(['\uFEFF' + [head.join(';'), ...lines].join('\n')], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');

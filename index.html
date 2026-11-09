@@ -261,6 +261,13 @@
         .kpi.dark .v {
             color: var(--lime);
         }
+
+        .forecast-tone-blue { color: #0d6efd !important; }
+        .forecast-tone-yellow { color: #a86f00 !important; }
+        .forecast-tone-red { color: #dc3545 !important; }
+        .kpi.dark .forecast-tone-blue { color: #8ab4ff !important; }
+        .kpi.dark .forecast-tone-yellow { color: #ffd166 !important; }
+        .kpi.dark .forecast-tone-red { color: #ff8a8a !important; }
         
         .kpi.dark .badge {
             background: rgba(255, 255, 255, .15) !important;
@@ -521,7 +528,7 @@
 
             <div class="topbar">
                 <div>
-                    <h1 id="pageTitle">Скринінг ризику діабету</h1>
+                    <h1 id="pageTitle">Прогноз до наступного візиту</h1>
                     <small id="topDate">-</small>
                 </div>
                 <button class="btn btn-lime no-print" onclick="printReport()"><svg class="ic me-1"><use href="#i-printer"/></svg> Друк / PDF</button>
@@ -576,7 +583,7 @@
                         </div>
                     </div>
                     <div class="col-md-3">
-                        <div class="kpi"><span class="lbl text-danger">Високий ризик</span>
+                        <div class="kpi"><span class="lbl text-danger" id="cohortHighLabel">Високий ризик</span>
                             <div class="v text-danger" id="cohortHigh">-</div>
                         </div>
                     </div>
@@ -611,6 +618,7 @@
                                     <th>Вік, стать</th>
                                     <th id="thCohortHba1c">HbA1c зараз</th>
                                     <th>HbA1c прогноз</th>
+                                    <th>Наступний візит</th>
                                     <th>Зміна</th>
                                     <th id="thCohortRisk">Ризик</th>
                                     <th>Рівень</th>
@@ -670,7 +678,7 @@
                         </select></div>
                         <div class="col-md-3"><label class="lbl">Глюкоза натще (ммоль/л)</label><input type="number" step="0.01" class="form-control" id="labGlucose" placeholder="Норма: < 5.6" required><small class="norm">Норма &lt; 5.6 · предіабет 5.6–6.9 · ЦД ≥ 7.0 (ціль при ЦД2: 4.4–7.2)</small></div>
                         <div class="col-md-3"><label class="lbl">HbA1c (%)</label><input type="number" step="0.1" class="form-control" id="labHba1c" placeholder="Норма: < 5.7" required><small class="norm">Норма &lt; 5.7% · предіабет 5.7–6.4% · ЦД ≥ 6.5% (ціль при ЦД2: &lt; 7%)</small></div>
-                        <div class="col-md-3"><label class="lbl">Тригліцериди (ммоль/л)</label><input type="number" step="0.01" class="form-control" id="labTriglycerides" value="1.7" required><small class="norm">Норма &lt; 1.7 · погранично 1.7–2.2 · високі ≥ 2.3</small></div>
+                        <div class="col-md-3"><label class="lbl">Тригліцериди (ммоль/л)</label><input type="number" step="0.01" min="0.1" max="50" class="form-control" id="labTriglycerides" placeholder="Введіть результат аналізу" required><small class="norm">Потрібні для повного набору прогнозу · норма &lt; 1.7</small></div>
                         <div class="col-md-4"><label class="lbl">ІМТ (кг/м²)</label><input type="number" step="0.1" class="form-control" id="labBmi" placeholder="Норма: 18.5–24.9" required><small class="norm">Норма 18.5–24.9 · надмірна вага 25–29.9 · ожиріння ≥ 30</small></div>
                         <div class="col-md-4"><label class="lbl">Систолічний АТ</label><input type="number" class="form-control" id="labBpSystolic" placeholder="Норма: < 130" required><small class="norm">Норма &lt; 130 мм рт.ст. · гіпертензія ≥ 140</small></div>
                         <div class="col-md-4"><label class="lbl">Діастолічний АТ</label><input type="number" class="form-control" id="labBpDiastolic" value="80" required><small class="norm">Норма &lt; 80 мм рт.ст. · гіпертензія ≥ 90</small></div>
@@ -703,22 +711,23 @@
                         <div class="kpi">
                             <span class="lbl"><svg class="ic me-1"><use href="#i-trend"/></svg> Прогноз HbA1c (Tier 2)</span>
                             <div id="predictedHbA1c" class="v text-primary">0%</div>
-                            <small class="text-muted d-block">Прогноз на наступний візит</small>
+                            <small class="text-muted d-block" id="forecastDateText">На очікувану дату наступного візиту</small>
                             <small class="norm" id="normKpiForecast"></small>
                         </div>
                     </div>
                     <div class="col-md-4">
                         <div class="kpi">
                             <div class="d-flex justify-content-between align-items-start gap-2">
-                                <span class="lbl text-danger" id="riskTitle">Ризик</span>
+                                <span class="lbl text-danger" id="riskTitle">Прогноз появи ЦД2 до наступного візиту</span>
                                 <span id="riskBadge" class="badge badge-forecast bg-secondary">...</span>
                             </div>
-                            <div id="riskScore" class="v text-danger">0%</div>
+                            <div id="riskScore" class="v text-primary">—</div>
                             <small class="text-muted d-block" id="riskSubtitle">-</small>
                             <small class="norm" id="normKpiRisk"></small>
                         </div>
                     </div>
                 </div>
+                <div class="small text-muted mb-2" id="forecastColorLegend"></div>
                 <div class="advice mb-3" id="recommendationText">-</div>
 
                 <div class="row g-3">
@@ -727,12 +736,11 @@
                             <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
                                 <div>
                                     <h6 class="mb-0"><svg class="ic me-2"><use href="#i-trend"/></svg>Динаміка показників та прогноз</h6>
-                                    <small class="text-muted">Прогноз HbA1c — ML-модель; глюкози й АТ — лінійний тренд останніх візитів</small>
+                                    <small class="text-muted" id="forecastChartCaption">Tier 1 оцінює появу запису про ЦД2 до наступного візиту, Tier 2 — HbA1c на цю дату</small>
                                 </div>
                                 <div class="seg no-print">
                                     <button data-chart="hba1c" class="active" onclick="switchChart('hba1c')">HbA1c</button>
                                     <button data-chart="glucose" onclick="switchChart('glucose')">Глюкоза</button>
-                                    <button data-chart="bp" onclick="switchChart('bp')">АТ</button>
                                 </div>
                             </div>
                             <div style="position: relative; height: 340px;"><canvas id="mainChart"></canvas></div>
@@ -778,7 +786,7 @@
                                     <div class="tile"><span class="lbl d-block"><svg class="ic me-1"><use href="#i-activity"/></svg>HbA1c</span><strong id="valHba1cTile">-</strong><span id="statusHba1c" class="status-tag">-</span><span class="norm" id="normHba1c"></span></div>
                                 </div>
                                 <div class="col-6">
-                                    <div class="tile"><span class="lbl d-block"><svg class="ic me-1"><use href="#i-droplet"/></svg>Тригліцериди</span><strong id="valTrig">-</strong><span id="statusTrig" class="status-tag">-</span><span class="norm" id="normTrig"></span></div>
+                                    <div class="tile" id="tileTrig"><span class="lbl d-block"><svg class="ic me-1"><use href="#i-droplet"/></svg>Тригліцериди</span><strong id="valTrig">-</strong><span id="statusTrig" class="status-tag">-</span><span class="norm" id="normTrig"></span></div>
                                 </div>
                             </div>
                             <small class="text-muted d-block mt-2" id="normsNote" style="font-size:.7rem"></small>

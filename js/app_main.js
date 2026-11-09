@@ -15,6 +15,25 @@ const isNum = (v) => v !== null && v !== undefined && !Number.isNaN(Number(v));
 const fmt = (v, digits = 1, suffix = '') => (isNum(v) ? Number(v).toFixed(digits) + suffix : '—');
 const icon = (id, cls = 'me-1') => `<svg class="ic ${cls}"><use href="#${id}"/></svg>`;
 const isDiabetic = () => currentMode === 'complication';
+const FORECAST_TONES = ['forecast-tone-blue', 'forecast-tone-yellow', 'forecast-tone-red'];
+function setForecastTone(id, tone) {
+    const el = $(id);
+    if (!el) return;
+    el.classList.remove(...FORECAST_TONES);
+    if (tone) el.classList.add(`forecast-tone-${tone}`);
+}
+function hba1cTone(value, diabetic) {
+    if (!isNum(value)) return null;
+    const n = Number(value);
+    const yellowAt = diabetic ? 7 : 5.7;
+    const redAt = diabetic ? 8 : 6.5;
+    return n < yellowAt ? 'blue' : n < redAt ? 'yellow' : 'red';
+}
+function tier1Tone(probability, threshold) {
+    if (!isNum(probability)) return null;
+    const p = Number(probability);
+    return p < Number(threshold) ? 'blue' : p < 60 ? 'yellow' : 'red';
+}
 
 // ── Статуси показників: [текст, рівень]. Для ЦД2 — цільові значення, а не діагностичні пороги ──
 const LEVEL_CLASS = { ok: 'text-success', warn: 'text-warning', bad: 'text-danger', na: 'text-muted' };
@@ -50,7 +69,7 @@ const NORMS = {
         normTrig: 'Норма < 1.7 ммоль/л',
         normKpiHba1c: 'Норма < 5.7% · предіабет 5.7–6.4% · ЦД ≥ 6.5%',
         normKpiForecast: 'Норма < 5.7% · ЦД ≥ 6.5%',
-        normKpiRisk: 'Шкала: < 30% низький · 30–59% помірний · ≥ 60% високий',
+        normKpiRisk: 'Модельний бал і поріг сповіщення, не діагноз',
         normsNote: 'Норми МОЗ/ВООЗ: ІМТ 18.5–24.9 · глюкоза натще < 5.6 ммоль/л · HbA1c < 5.7% · АТ < 130/80 · тригліцериди < 1.7 ммоль/л',
         thHba1c: 'HbA1c<span class="norm">норма &lt; 5.7%</span>',
         thGlucose: 'Глюкоза<span class="norm">норма &lt; 5.6</span>',
@@ -64,7 +83,7 @@ const NORMS = {
         normTrig: 'Норма < 1.7 ммоль/л',
         normKpiHba1c: 'Ціль при ЦД 2 типу: < 7.0%',
         normKpiForecast: 'Ціль при ЦД 2 типу: < 7.0%',
-        normKpiRisk: 'Шкала: < 25% низький · 25–49% помірний · ≥ 50% високий',
+        normKpiRisk: 'Правила: 0–100 балів, не ймовірність',
         normsNote: 'Цільові значення при ЦД 2 типу (індивідуалізуються лікарем): HbA1c < 7% · глюкоза натще 4.4–7.2 ммоль/л · АТ < 130/80 · ІМТ 18.5–24.9 · тригліцериди < 1.7 ммоль/л',
         thHba1c: 'HbA1c<span class="norm">ціль &lt; 7%</span>',
         thGlucose: 'Глюкоза<span class="norm">ціль 4.4–7.2</span>',
@@ -84,6 +103,10 @@ function applyNorms() {
 }
 
 const RISK_BADGE_CLASS = [
+    ['низька точність на тесті', 'badge badge-forecast bg-secondary'],
+    ['не пройшла перевірку', 'badge badge-forecast bg-secondary'],
+    ['Недостатньо даних', 'badge badge-forecast bg-secondary'],
+    ['Понад поріг', 'badge badge-forecast bg-warning text-dark'],
     ['Високий', 'badge badge-forecast bg-danger'],
     ['Помірний', 'badge badge-forecast bg-warning text-dark'],
 ];
@@ -164,7 +187,7 @@ function renderRiskFactors(prof, life) {
 }
 
 const TAB_IDS = { risk: 'tabRisk', complication: 'tabComplication', lab: 'tabLab' };
-const PAGE_TITLES = { risk: 'Скринінг ризику діабету', complication: 'Ризик судинних ускладнень (ЦД 2 типу)', lab: 'Введення лабораторних даних' };
+const PAGE_TITLES = { risk: 'Прогноз до наступного візиту', complication: 'Оцінка ускладнень до наступного візиту', lab: 'Введення лабораторних даних' };
 
 document.addEventListener('DOMContentLoaded', () => {
     setText('printDate', new Date().toLocaleDateString('uk-UA'));
@@ -253,8 +276,8 @@ async function switchMode(mode) {
     const riskTitle = $('riskTitle');
     if (riskTitle) {
         riskTitle.innerHTML = isRisk ?
-            '<svg class="ic me-1"><use href="#i-shield"/></svg> Ризик захворюваності' :
-            '<svg class="ic me-1"><use href="#i-activity"/></svg> Ризик судинних ускладнень';
+            '<svg class="ic me-1"><use href="#i-shield"/></svg> Прогноз появи ЦД2 до наступного візиту' :
+            '<svg class="ic me-1"><use href="#i-activity"/></svg> Індекс судинного ризику';
     }
     const patientInfo = $('patientInfoBadge');
     if (patientInfo) patientInfo.innerHTML = '<svg class="ic me-1"><use href="#i-info"/></svg> Оберіть картку для завантаження аналізів';
@@ -322,6 +345,8 @@ async function loadPatientData() {
         setStatus('statusHba1c', statusOf(STATUS.hba1c, prof.HbA1c, d));
         setText('valTrig', fmt(prof.triglycerides, 2, ' ммоль/л'));
         setStatus('statusTrig', statusOf(STATUS.trig, prof.triglycerides));
+        const trigTile = $('tileTrig');
+        if (trigTile) trigTile.style.display = isNum(prof.triglycerides) ? '' : 'none';
 
         // Спосіб життя — реальні дані, які вводить лікар (не генеруються)
         setSelect('lifeSmoking', life.smoking);
@@ -332,23 +357,39 @@ async function loadPatientData() {
         renderRiskFactors(prof, life);
 
         setText('valHba1cCurrent', fmt(prof.HbA1c, 1, '%'));
+        setForecastTone('valHba1cCurrent', hba1cTone(prof.HbA1c, d));
         setText('dataQuality', (isNum(data.data_quality) ? data.data_quality : 100) + '%');
         $('patientInfoBadge').innerHTML =
             `<span class="badge bg-dark p-2 fs-6">ID: <b>${escapeHtml(data.patient_id)}</b> | Стать: <b>${escapeHtml(prof.sex)}</b> | Статус: <b>${data.is_diabetic ? 'Підтверджений ЦД2' : 'Без діабету'}</b></span>`;
 
         const comp = ml.complication;
-        if (comp) { // Модуль 2: ризик ускладнень у відсотках (оцінка за правилами, не ML-ймовірність)
-            setText('riskScore', comp.score + '%');
-            setText('riskSubtitle', `Оцінка за правилами (не ML) · мікро ${comp.micro}% · макро ${comp.macro}% · прогноз: ${comp.forecast_score}%`);
+        setText('forecastDateText', `Очікувана дата наступного візиту: ${data.next_visit_date} · через ${data.days_to_next_visit} дн.`);
+        setText('forecastChartCaption', `Tier 1: поява запису про ЦД2 до ${data.next_visit_date} · Tier 2: HbA1c на цю дату`);
+        if (comp) { // Модуль 2: експертний індекс 0–100 у відсотковому форматі, не ймовірність події
+            setText('riskScore', `${comp.score}%`);
+            setForecastTone('riskScore', comp.score >= 50 ? 'red' : comp.score >= 25 ? 'yellow' : 'blue');
+            setText('riskSubtitle', `На ${data.next_visit_date} · мікросудинний індекс ${comp.micro}% · макросудинний ${comp.macro}% · сценарій ${comp.forecast_score}%`);
+            setText('normKpiRisk', 'Експертний індекс 0–100%; не ймовірність судинної події');
         } else {
-            setText('riskScore', ml.risk_score + '%');
-            setText('riskSubtitle', 'Ймовірність діабету (ML Tier 1)');
+            setText('riskScore', isNum(ml.risk_score) ? ml.risk_score + '%' : '—');
+            setForecastTone('riskScore', tier1Tone(ml.risk_score, ml.risk_threshold));
+            const riskText = isNum(ml.risk_score)
+                ? `Ймовірність появи запису про ЦД2 до очікуваної дати · поріг ${ml.risk_threshold}% · часова тестова ROC-AUC ${Number(ml.risk_model_auc).toFixed(2)}`
+                : 'Для прогнозу потрібні повні аналізи та історія дат візитів.';
+            setText('riskSubtitle', riskText);
+            setText('normKpiRisk', 'Оцінює появу запису про ЦД2; діагноз не встановлює');
         }
         setText('predictedHbA1c', ml.predicted_hba1c + '%');
+        setForecastTone('predictedHbA1c', hba1cTone(ml.predicted_hba1c, d));
+        const threshold = isNum(ml.risk_threshold) ? Number(ml.risk_threshold).toFixed(1) : 'порога';
+        setText('forecastColorLegend', d
+            ? 'Кольори: HbA1c — синій <7%, жовтий 7–<8%, червоний ≥8%; індекс судинного ризику — синій <25%, жовтий 25–<50%, червоний ≥50%.'
+            : `Кольори: Tier 1 — синій <${threshold}%, жовтий ${threshold}–<60%, червоний ≥60%; HbA1c — синій <5.7%, жовтий 5.7–<6.5%, червоний ≥6.5%.`);
+        setText('normKpiForecast', `На ${data.next_visit_date} · MAE часового тесту ${isNum(ml.hba1c_test_mae) ? Number(ml.hba1c_test_mae).toFixed(2) + ' п.п.' : 'не розраховано'}`);
         setText('recommendationText', '💡 Порада СППР: ' + ml.recommendation);
 
         const badge = $('riskBadge');
-        badge.innerText = ml.risk_level;
+        badge.innerText = ml.risk_level || 'Недостатньо даних';
         badge.className = riskBadgeClass(ml.risk_level);
 
         // Текст висновків формується на сервері і містить <b>, тому вставляється як HTML

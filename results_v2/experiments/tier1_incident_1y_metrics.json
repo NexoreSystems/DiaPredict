@@ -1,0 +1,35 @@
+{
+  "cohort_n": 9743,
+  "cohort_events": 2729,
+  "train_n": 6821,
+  "train_events": 1888,
+  "validation_n": 1463,
+  "validation_events": 364,
+  "features": [
+    "glucose_fasting",
+    "HbA1c"
+  ],
+  "data_note": "Predictors are observed fasting glucose and HbA1c available by the index visit. No missing patient laboratory values are imputed. Patients without both observed predictors are not scored. Outcome is a recorded diagnosis code. This is not external clinical validation or a diagnosis of biological disease onset.",
+  "test": {
+    "test_period_start": "2021-10-01",
+    "test_period_end": "2024-12-04",
+    "n_test": 1459,
+    "n_positive_test": 477,
+    "prevalence_test": 0.3269362577107608,
+    "roc_auc": 0.508042031194627,
+    "pr_auc_average_precision": 0.3341326643219553,
+    "brier_score": 0.2261391511800691,
+    "screening_threshold": 0.2475998850788665,
+    "high_threshold": 1.0,
+    "recall_at_screening_threshold": 0.740041928721174,
+    "precision_at_screening_threshold": 0.3235563703024748,
+    "recall_at_high_threshold": 0.0,
+    "precision_at_high_threshold": 0.0,
+    "f1_threshold_validation_only": 0.24758514644259622,
+    "tn": 244,
+    "fp": 738,
+    "fn": 124,
+    "tp": 353
+  },
+  "target_definition": "First recorded ICD-10 E11 diagnosis within 365 days after an eligible visit with a fasting-glucose result, among patients without a prior recorded E11 diagnosis at that visit."
+}

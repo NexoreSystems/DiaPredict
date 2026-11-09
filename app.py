@@ -34,7 +34,7 @@ mimetypes.add_type("application/javascript", ".js", True)
 
 # ───────────────────────── Конфігурація ─────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-TABLE = "patient_records"
+TABLE = os.getenv("MYSQL_TABLE", "patient_records_observed")
 GLUCOSE_MMOL_TO_MGDL = 18.015
 TRIGLYCERIDES_MMOL_TO_MGDL = 88.57
 
@@ -86,19 +86,25 @@ def _load_bundle(name: str):
 
 t1_v2 = _load_bundle("tier1_v2.joblib")
 t2_v2 = _load_bundle("tier2_v2.joblib")
+t1_forecast = _load_bundle("tier1_next_visit.joblib")
+t2_next_visit = _load_bundle("tier2_next_visit.joblib")
 logger.info("Tier 1: %s | Tier 2: %s",
-            f"v2 ({t1_v2['name']})" if t1_v2 else "v1",
-            f"v2 ({t2_v2['name']})" if t2_v2 else "v1")
+            f"next visit ({t1_forecast['name']})" if t1_forecast else
+            (f"v2 ({t1_v2['name']})" if t1_v2 else "v1"),
+            f"next visit ({t2_next_visit['name']})" if t2_next_visit else
+            (f"v2 ({t2_v2['name']})" if t2_v2 else "v1"))
 
 T1_DEFAULTS = {"age": 50, "glucose_fasting": 100, "HbA1c": 6.0,
-               "bmi": 25, "systolic_bp": 120, "triglycerides": 150}
+               "bmi": 25, "systolic_bp": 120, "triglycerides": np.nan}
 T2_DEFAULTS = {"HbA1c": 6.0, "glucose_fasting": 100, "bmi": 25, "age": 50}
 T1_BASE = list(T1_DEFAULTS)
 
-# Межі категорій ризику для Tier 1. У v2 нижня межа — скринінговий поріг (Recall ≥ 80%),
-# верхня — 0.5 (на тесті Precision ≈ 96%).
-RISK_LOW = t1_v2["thresholds"]["screening"] if t1_v2 else 0.3
-RISK_HIGH = 0.5 if t1_v2 else 0.6
+# Tier 1: нижня межа — поріг скринінгового сповіщення. Високий рівень
+# не визначається лише за моделлю, бо його поріг не підтвердився на часовому тесті.
+RISK_LOW = (t1_forecast["thresholds"]["screening"] if t1_forecast else
+            (t1_v2["thresholds"]["screening"] if t1_v2 else 0.3))
+REQUIRED_FORECAST_FIELDS = ("age", "glucose_fasting", "HbA1c", "bmi", "systolic_bp", "triglycerides")
+MIN_PRIOR_INTERVALS = 2
 
 
 class LabRecordInput(BaseModel):
@@ -113,7 +119,7 @@ class LabRecordInput(BaseModel):
     bmi: float = Field(ge=10, le=80)
     systolic_bp: float = Field(ge=60, le=260)
     diastolic_bp: float = Field(default=80.0, ge=30, le=160)
-    triglycerides: float = Field(default=1.7, ge=0.1, le=50)
+    triglycerides: float = Field(ge=0.1, le=50)
     # Спосіб життя вводить лікар/лаборант; порожнє значення = "не змінювати"
     smoking: Optional[str] = None
     alcohol: Optional[str] = None
@@ -169,12 +175,65 @@ def _last_valid(df: pd.DataFrame, col: str):
     return None if s.empty else float(s.iloc[-1])
 
 
+def _estimate_next_visit(dates):
+    """Estimate the next visit by the median of at least two observed prior intervals."""
+    observed = pd.Series(pd.to_datetime(list(dates), errors="coerce")).dropna().drop_duplicates().sort_values()
+    if len(observed) < MIN_PRIOR_INTERVALS + 1:
+        return None, None
+    gaps = observed.diff().dt.days.dropna()
+    gaps = gaps[gaps > 0]
+    if len(gaps) < MIN_PRIOR_INTERVALS:
+        return None, None
+    days = max(1, int(round(float(gaps.median()))))
+    return observed.iloc[-1] + pd.Timedelta(days=days), days
+
+
+def _complete_latest_visits(df: pd.DataFrame) -> pd.DataFrame:
+    """Return each patient's latest complete panel after at least three such visits."""
+    if df.empty or "patient_id" not in df or "test_date" not in df:
+        return pd.DataFrame()
+    d = _normalize_columns(df.copy())
+    d["patient_id"] = d["patient_id"].astype(str)
+    d["test_date"] = pd.to_datetime(d["test_date"], errors="coerce")
+    for field in REQUIRED_FORECAST_FIELDS:
+        d[field] = pd.to_numeric(d[field], errors="coerce") if field in d else np.nan
+        d[field] = d[field].where(np.isfinite(d[field]))
+    d = d.dropna(subset=["patient_id", "test_date"])
+    # Merge rows only within one patient/date encounter; never carry values from older visits.
+    visits = (d.sort_values(["patient_id", "test_date"], kind="stable")
+              .groupby(["patient_id", "test_date"], as_index=False, sort=False).last())
+    fields = list(REQUIRED_FORECAST_FIELDS)
+    complete_mask = visits[fields].notna().all(axis=1)
+    # Match model training: use the latest fully observed panel. Later dates with
+    # only partial tests do not become a model input or copy older measurements.
+    complete = visits.loc[complete_mask].copy()
+    complete = complete.sort_values(["patient_id", "test_date"], kind="stable")
+    groups = complete.groupby("patient_id", sort=False)
+    complete["interval_days"] = groups["test_date"].diff().dt.days
+    complete["previous_hba1c"] = groups["HbA1c"].shift(1)
+    complete["previous_glucose"] = groups["glucose_fasting"].shift(1)
+    complete["previous_systolic_bp"] = groups["systolic_bp"].shift(1)
+    stats = complete.groupby("patient_id", sort=False).agg(
+        visits=("test_date", "size"),
+        interval_count=("interval_days", "count"),
+        median_interval=("interval_days", "median"),
+    )
+    stats = stats[stats["interval_count"] >= MIN_PRIOR_INTERVALS]
+    if stats.empty:
+        return pd.DataFrame()
+    current = complete.groupby("patient_id", sort=False).tail(1).set_index("patient_id")
+    current = current.join(stats, how="inner", rsuffix="_stats")
+    current["days_to_next_visit"] = current["median_interval"].round().clip(lower=1).astype(int)
+    next_dates = current["test_date"] + pd.to_timedelta(current["days_to_next_visit"], unit="D")
+    current["next_visit_date"] = next_dates.dt.date.astype(str)
+    return current.reset_index()
+
+
 def _trig_to_mmol(raw):
-    """Тригліцериди в БД зберігаються в мг/дл (так записує форма введення).
-    Якщо значення схоже на ммоль/л (≤ 20) — додатково не конвертуємо."""
+    """Database contract: triglycerides are stored in mg/dL."""
     if raw is None:
         return None
-    return raw if raw <= 20 else raw / TRIGLYCERIDES_MMOL_TO_MGDL
+    return raw / TRIGLYCERIDES_MMOL_TO_MGDL
 
 
 def _features(latest: dict, defaults: dict) -> pd.DataFrame:
@@ -182,8 +241,24 @@ def _features(latest: dict, defaults: dict) -> pd.DataFrame:
 
 
 def _t1_proba(frame: pd.DataFrame) -> np.ndarray:
-    """Ймовірність діабету (Tier 1). frame — рядки з колонками age, glucose_fasting, HbA1c,
-    bmi, systolic_bp, triglycerides (останній візит кожного пацієнта)."""
+    """Tier 1 score: probability of a first recorded type 2 diabetes diagnosis by next visit."""
+    if t1_forecast is None:
+        return np.full(len(frame), np.nan, dtype=float)
+    if t1_forecast is not None:
+        features = t1_forecast["features"]
+        x = pd.DataFrame({k: (pd.to_numeric(frame[k], errors="coerce") if k in frame.columns
+                              else pd.Series(np.nan, index=frame.index)) for k in features if k != "tg_missing"})
+        available = x[features].notna().all(axis=1)
+        result = np.full(len(x), np.nan, dtype=float)
+        if not available.any():
+            return result
+        raw = np.clip(t1_forecast["model"].predict_proba(x.loc[available, features])[:, 1], 1e-6, 1 - 1e-6)
+        calibrator = t1_forecast.get("calibrator")
+        if calibrator is not None:
+            logits = np.log(raw / (1 - raw)).reshape(-1, 1)
+            raw = calibrator.predict_proba(logits)[:, 1]
+        result[available.to_numpy()] = raw
+        return result
     if t1_v2 is None:
         x = pd.DataFrame({k: (pd.to_numeric(frame[k], errors="coerce") if k in frame.columns
                               else pd.Series(np.nan, index=frame.index)).fillna(d).astype(float)
@@ -218,6 +293,8 @@ def _t2_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def _t2_predict(feat: pd.DataFrame) -> np.ndarray:
     """Прогноз HbA1c на наступний візит за ознаками з _t2_features."""
+    if t2_next_visit is not None:
+        return t2_next_visit["model"].predict(feat[t2_next_visit["features"]])
     if t2_v2 is None:
         return t2_model.predict(feat[list(T2_DEFAULTS)])
     pred = t2_v2["model"].predict(feat[t2_v2["features"]])
@@ -320,7 +397,7 @@ def _build_clinical_summary(hba1c, prev_hba1c, glucose_mmol, predicted_hba1c,
         actions.append("Призначити низьковуглеводну дієту (Стіл №9) та 150 хв/тиж аеробних навантажень.")
     else:
         conclusions.append(f"<b>Глікемія:</b> Нормоглікемія (HbA1c {hba1c:.1f}%, Глюкоза {glucose_mmol:.2f} ммоль/л).")
-        actions.append("Плановий профілактичний огляд через 12 місяців.")
+        actions.append("Плановий профілактичний огляд за рекомендованим графіком.")
 
     if predicted_hba1c > hba1c + 0.2:
         conclusions.append(f"<b>ML Прогноз:</b> Траєкторія підвищення HbA1c до {predicted_hba1c:.1f}% у наступному періоді.")
@@ -341,15 +418,36 @@ def _build_clinical_summary(hba1c, prev_hba1c, glucose_mmol, predicted_hba1c,
 
 
 def _risk_assessment(risk_prob: float, hba1c: float, glucose_mmol: float):
-    """Модуль 1. Лабораторні критерії діабету мають пріоритет над ML-ймовірністю."""
+    """Keep the model alert band separate from diagnostic-range laboratory findings."""
+    auc = (t1_forecast or {}).get("metrics", {}).get("roc_auc")
+    if risk_prob is None or not np.isfinite(risk_prob):
+        return "Недостатньо даних", "Прогноз не розраховано: потрібні наявні вимірювання глюкози натще та HbA1c."
+    above_threshold = risk_prob >= RISK_LOW
+    level = "Понад поріг сповіщення" if above_threshold else "Нижче порога сповіщення"
+    if auc is not None and auc < 0.60:
+        level += " · низька точність на тесті"
+        message = (f"Прогноз до очікуваного наступного візиту: {risk_prob * 100:.1f}%. "
+                   f"Часовий тест ROC-AUC {auc:.2f}; модель має обмежену розрізнювальну здатність.")
+        if hba1c >= 6.5 or glucose_mmol >= 7.0:
+            message += (" Окремо: лабораторний результат у діагностичному діапазоні; "
+                        "потрібні клінічна оцінка й підтвердження.")
+        return level, message
     if hba1c >= 6.5 or glucose_mmol >= 7.0:
-        return ("Високий ризик (лабораторні ознаки ЦД)",
-                "Показники в діапазоні діабету: потрібне підтверджувальне обстеження та консультація ендокринолога.")
-    if risk_prob < RISK_LOW:
-        return "Низький ризик", "Показники в межах норми."
-    if risk_prob < RISK_HIGH:
-        return "Помірний ризик", "Модифікація способу життя."
-    return "Високий ризик", "Високий ризик розвитку діабету!"
+        recommendation = (
+            "Окремо: лабораторний результат у діагностичному діапазоні. "
+            "Потрібна клінічна оцінка й підтвердження; прогноз Tier 1 діагноз не встановлює."
+        )
+    elif above_threshold:
+        recommendation = (
+            "Оцінка перевищила внутрішній поріг скринінгового сповіщення. "
+            "Розгляньте лабораторне обстеження та клінічну оцінку."
+        )
+    else:
+        recommendation = (
+            "Оцінка нижче внутрішнього порога сповіщення. Це не виключає діабет "
+            "і не замінює лабораторне обстеження за показаннями."
+        )
+    return level, recommendation
 
 
 def _trend_forecast(values):
@@ -399,8 +497,9 @@ def _complication_scores(hba1c, prev_hba1c, glucose_mmol, bp, bmi, trig_mmol, ag
     # Вага, ліпіди, вік
     add("macro", 20 if bmi >= 35 else 15 if bmi >= 30 else 5 if bmi >= 25 else 0,
         f"ІМТ {bmi:.1f} кг/м²")
-    add("macro", 10 if trig_mmol >= 2.3 else 5 if trig_mmol >= 1.7 else 0,
-        f"тригліцериди {trig_mmol:.1f} ммоль/л")
+    if trig_mmol is not None and np.isfinite(trig_mmol):
+        add("macro", 10 if trig_mmol >= 2.3 else 5 if trig_mmol >= 1.7 else 0,
+            f"тригліцериди {trig_mmol:.1f} ммоль/л")
     add("macro", 15 if age >= 75 else 10 if age >= 60 else 5 if age >= 45 else 0, f"вік {age} р.")
 
     micro, macro = min(micro, 100), min(macro, 100)
@@ -418,17 +517,20 @@ def _complication_assessment(hba1c, prev_hba1c, glucose_mmol, bp, bmi, trig_mmol
         predicted_hba1c, hba1c, glucose_next, bp_next, bmi, trig_mmol, age, None)
 
     if score < 25:
-        level, rec = "Низький ризик ускладнень", "Стабільний стан, контроль через 6 міс."
+        level, rec = "Низький індекс судинного ризику", "Оцінку слід розглядати разом із лікарем; правила не валідовані."
     elif score < 50:
-        level, rec = "Помірний ризик ангіопатії", "Потрібна корекція терапії для профілактики ускладнень."
+        level, rec = "Помірний індекс судинного ризику", "Обговоріть показники з лікарем; правила не визначають лікування."
     else:
-        level = "Високий судинний ризик"
-        rec = ("Високий ризик ускладнень: поглиблене обстеження (очне дно, альбумінурія/ШКФ, ЕКГ) "
-               "та перегляд терапії.")
+        level = "Високий індекс судинного ризику"
+        rec = ("Індекс судинного ризику високий. Обговоріть із лікарем потребу в обстеженні; "
+               "правила не валідовані й не визначають лікування.")
 
     top = ", ".join(factors[:3]) if factors else "значущих факторів ризику не виявлено"
-    summary = (f"<b>Ризик ускладнень:</b> {score}% (мікросудинні {micro}%, макросудинні {macro}%); "
-               f"прогноз на наступний візит — {forecast_score}%. Оцінка за клінічними правилами, не калібрована ймовірність. "
+    summary = (f"<b>Індекс судинного ризику:</b> {score}% "
+               f"(мікросудинний {micro}%, макросудинний {macro}%); "
+               f"сценарний індекс на наступний візит — {forecast_score}%. "
+               f"Це експертна шкала 0–100, не ймовірність події й не валідована шкала. "
+               f"Тригліцериди {'виміряні' if trig_mmol is not None else 'не виміряні; їхній внесок не враховано'}. "
                f"Основні фактори: {top}.")
     return {"score": score, "micro": micro, "macro": macro, "forecast_score": forecast_score,
             "factors": factors[:3], "level": level, "recommendation": rec, "summary": summary}
@@ -457,7 +559,7 @@ def get_all_patients_for_lab():
 
         patients = [{
             "patient_id": str(r.patient_id),
-            "age": int(_num(r.age, 50)),
+            "age": int(float(r.age)),
             "sex": "M" if pd.isna(r.sex) else str(r.sex),
             "dx_type2_diabetes": int(_num(r.dx_type2_diabetes, 0)),
             "last_visit": "" if pd.isna(r.test_date) else str(r.test_date),
@@ -475,26 +577,22 @@ def get_all_patients_for_lab():
 @app.get("/api/patients")
 def get_patients_list(mode: str = "risk", q: str = ""):
     try:
-        query = text(f"""
-            SELECT patient_id, MAX(age) AS age, MAX(sex) AS sex, COUNT(*) AS visits
-            FROM {TABLE}
-            WHERE dx_type2_diabetes = :dx_val AND patient_id LIKE :q
-            GROUP BY patient_id
-            ORDER BY patient_id
-            LIMIT 300
-        """)
-        with engine.connect() as conn:
-            df = pd.read_sql(query, con=conn, params={"dx_val": 0 if mode == "risk" else 1,
-                                                 "q": f"%{q.strip()}%"})
+        if mode not in ("risk", "complication"):
+            raise HTTPException(422, "mode: допустимі значення risk або complication")
+        eligible = _eligible_patient_rows(mode)
+        query = q.strip().lower()
+        if query:
+            eligible = eligible[eligible["patient_id"].str.lower().str.contains(query, regex=False)]
+        eligible = eligible.sort_values("patient_id").head(300)
 
-        status = "Група ризику / Скринінг" if mode == "risk" else "Підтверджений ЦД 2 типу"
         return [{
             "patient_id": str(r.patient_id),
-            "age": int(_num(r.age, 50)),
+            "age": int(float(r.age)),
             "sex": "M" if pd.isna(r.sex) else str(r.sex),
             "visits": int(r.visits),
-            "status": status,
-        } for r in df.itertuples(index=False)]
+            "status": "Повні аналізи · наступний візит " + r.next_visit_date,
+            "next_visit_date": r.next_visit_date,
+        } for r in eligible.itertuples(index=False)]
     except Exception as e:
         logger.exception("patients list")
         raise HTTPException(status_code=500, detail=str(e))
@@ -543,7 +641,9 @@ def add_patient_record(record: LabRecordInput):
                 f"VALUES ({', '.join(f':{k}' for k in used)})"), used)
             _save_lifestyle(conn, pid, life)
 
-        _cohort_cache.clear()  # нові дані — прогноз для всіх пацієнтів треба перерахувати
+        _cohort_cache.clear()  # нові дані — оновлюємо прогноз і списки пацієнтів
+        with _patient_rows_lock:
+            _patient_rows_cache.clear()
         msg = f"Новий запис для пацієнта {pid} збережено!"
         if changed:
             msg += f" (ID {record.patient_id} уже зайнятий, призначено {pid})"
@@ -584,31 +684,41 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
         if p_df.empty:
             raise HTTPException(status_code=404, detail="Пацієнта не знайдено")
 
-        latest = p_df.iloc[-1].to_dict()
+        eligible_latest = _complete_latest_visits(p_df)
+        if eligible_latest.empty:
+            raise HTTPException(422, "Прогноз недоступний: немає повного набору аналізів і достатньої історії дат візитів.")
+        latest = eligible_latest.iloc[0].to_dict()
+        next_visit_date = latest["next_visit_date"]
+        days_to_next_visit = int(latest["days_to_next_visit"])
         prev = p_df.iloc[-2].to_dict() if len(p_df) > 1 else latest
 
-        # Tier 1 навчена на скринінгу — для пацієнтів із ЦД2 (модуль 2) не застосовується
-        risk_prob = float(_t1_proba(pd.DataFrame([latest]))[0]) if mode == "risk" else None
-        predicted_hba1c = float(_t2_predict(_t2_features(p_df).iloc[[-1]])[0])
+        model_features = pd.DataFrame([{**{k: latest[k] for k in REQUIRED_FORECAST_FIELDS},
+                                         "days_to_next_visit": days_to_next_visit}])
+        risk_raw = _t1_proba(model_features)[0] if mode == "risk" else None
+        risk_prob = float(risk_raw) if risk_raw is not None and np.isfinite(risk_raw) else None
+        risk_model_auc = (t1_forecast or {}).get("metrics", {}).get("roc_auc") if mode == "risk" else None
+        risk_usable = risk_prob is not None
+        predicted_hba1c = float(_t2_predict(model_features)[0])
 
         missing_cols = [c for c in ("HbA1c", "triglycerides") if c not in p_df.columns]
         if missing_cols:
             logger.warning("У таблиці %s немає колонок %s. Наявні колонки: %s", TABLE, missing_cols, list(p_df.columns))
-        hba1c_val = _num(latest.get("HbA1c"), _last_valid(p_df, "HbA1c") or 6.0)
-        prev_hba1c = _num(prev.get("HbA1c"), hba1c_val)
-        glucose_mmol = _num(latest.get("glucose_fasting"), 100) / GLUCOSE_MMOL_TO_MGDL
-        bmi_val = _num(latest.get("bmi"), 25)
-        bp_val = _num(latest.get("systolic_bp"), 120)
-        age_val = int(_num(latest.get("age"), 50))
-        trig_mmol_real = _trig_to_mmol(_last_valid(p_df, "triglycerides"))  # None, якщо в БД немає значень
+        hba1c_val = float(latest["HbA1c"])
+        prev_hba1c = _num(latest.get("previous_hba1c"), hba1c_val)
+        glucose_mmol = float(latest["glucose_fasting"]) / GLUCOSE_MMOL_TO_MGDL
+        bmi_val = float(latest["bmi"])
+        bp_val = float(latest["systolic_bp"])
+        age_val = int(float(latest["age"]))
+        trig_mmol_real = _trig_to_mmol(float(latest["triglycerides"]))
         trig_mmol_profile = None if trig_mmol_real is None else round(trig_mmol_real, 2)
 
-        key_fields = ("age", "glucose_fasting", "HbA1c", "bmi", "systolic_bp", "triglycerides")
-        quality = round(100 * sum(_num(latest.get(k), None) is not None for k in key_fields) / len(key_fields))
+        quality = 100
 
         tail = p_df.tail(8)
         glucose_trend = _trend_forecast(tail["glucose_fasting"] / GLUCOSE_MMOL_TO_MGDL)
-        bp_trend = _trend_forecast(tail["systolic_bp"])
+        # Blood pressure comes from the patient profile, not dated encounter
+        # measurements, so it is intentionally not forecast as a time series.
+        bp_trend = None
 
         lifestyle = _get_lifestyle(patient_id)
         conclusions, actions = _build_clinical_summary(
@@ -620,7 +730,7 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
         if mode != "risk":  # для підтвердженого ЦД2 оцінюємо ускладнення, а не ймовірність діабету
             complication = _complication_assessment(
                 hba1c_val, prev_hba1c, glucose_mmol, bp_val, bmi_val,
-                trig_mmol_real or 0, age_val, predicted_hba1c,
+                trig_mmol_real, age_val, predicted_hba1c,
                 glucose_trend if glucose_trend is not None else glucose_mmol,
                 bp_trend if bp_trend is not None else bp_val)
             risk_level, rec = complication["level"], complication["recommendation"]
@@ -637,7 +747,7 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
         recent = p_df.tail(8).copy()
         recent["glucose_fasting"] = recent["glucose_fasting"] / GLUCOSE_MMOL_TO_MGDL
         cols = ['test_date', 'formatted_date', 'days_from_start', 'HbA1c',
-                'glucose_fasting', 'bmi', 'systolic_bp']
+                'glucose_fasting']
         hist = recent[[c for c in cols if c in recent.columns]]
         history = [{k: (None if pd.isna(v) else v) for k, v in row.items()}  # пропуски = null, а не 0
                    for row in hist.to_dict(orient="records")]
@@ -655,12 +765,20 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
                 "triglycerides": trig_mmol_profile,
             },
             "data_quality": quality,
+            "next_visit_date": next_visit_date,
+            "days_to_next_visit": days_to_next_visit,
             "lifestyle": lifestyle,
             "ml_predictions": {
-                "risk_score": complication["score"] if complication else round(risk_prob * 100, 2),
+                "risk_score": complication["score"] if complication else (round(risk_prob * 100, 2) if risk_usable else None),
+                "tier1_probability": None if risk_prob is None else round(risk_prob * 100, 2),
                 "risk_level": risk_level,
+                "risk_threshold": round(RISK_LOW * 100, 1) if risk_usable else None,
+                "risk_horizon_days": days_to_next_visit if risk_usable else None,
+                "risk_model_auc": risk_model_auc,
                 "predicted_hba1c": round(predicted_hba1c, 2),
-                "model_version": "v2" if (t1_v2 or t2_v2) else "v1",
+                "hba1c_test_mae": (t2_next_visit or {}).get("metrics", {}).get("mae"),
+                "hba1c_test_n": (t2_next_visit or {}).get("metrics", {}).get("n_test"),
+                "model_version": "next_visit" if t1_forecast and t2_next_visit else ("v2" if (t1_v2 or t2_v2) else "v1"),
                 "recommendation": rec,
                 "complication": complication,
             },
@@ -682,11 +800,22 @@ def get_patient_history(patient_id: str, mode: str = "risk"):
 COHORT_TTL_SEC = 1800  # кеш на 30 хв; скидається при додаванні запису, кнопка "Перерахувати" оновлює вручну
 _cohort_cache: dict = {}
 _cohort_lock = Lock()  # паралельні запити не рахують те саме двічі
-_LEVEL_GROUPS = ("Низький", "Помірний", "Високий")
+PATIENT_ROWS_TTL_SEC = 300
+_patient_rows_cache: dict = {}
+_patient_rows_lock = Lock()
+_LEVEL_GROUPS = ("Низький", "Помірний", "Високий", "Недостатньо даних", "Модель не пройшла перевірку")
 
 
 def _risk_group(level: str) -> str:
-    return "Високий" if "Високий" in level else "Помірний" if "Помірний" in level else "Низький"
+    if "не пройшла перевірку" in level:
+        return "Модель не пройшла перевірку"
+    if "Недостатньо даних" in level:
+        return "Недостатньо даних"
+    if "Високий" in level:
+        return "Високий"
+    if "Понад поріг" in level or "Помірний" in level:
+        return "Помірний"
+    return "Низький"
 
 
 _COHORT_COLS = {"patient_id", "test_date", "age", "sex", "HbA1c", "glucose_fasting",
@@ -699,6 +828,21 @@ def _load_cohort_df(conn, mode: str) -> pd.DataFrame:
     cols = ", ".join(f"`{c}`" for c in real) or "*"
     return pd.read_sql(text(f"SELECT {cols} FROM {TABLE} WHERE dx_type2_diabetes = :dx"),
                        con=conn, params={"dx": 0 if mode == "risk" else 1})
+
+
+def _eligible_patient_rows(mode: str, refresh: bool = False) -> pd.DataFrame:
+    """Load and filter a cohort once; the selector search reuses this prepared list."""
+    if mode not in ("risk", "complication"):
+        raise HTTPException(422, "mode: допустимі значення risk або complication")
+    with _patient_rows_lock:
+        cached = _patient_rows_cache.get(mode)
+        if not refresh and cached and time.time() - cached[0] < PATIENT_ROWS_TTL_SEC:
+            return cached[1].copy()
+        with engine.connect() as conn:
+            df = _load_cohort_df(conn, mode)
+        eligible = _complete_latest_visits(_normalize_columns(df))
+        _patient_rows_cache[mode] = (time.time(), eligible)
+        return eligible.copy()
 
 
 def _cached_cohort(mode: str):
@@ -728,106 +872,77 @@ def forecast_all_patients(mode: str = "risk", refresh: bool = False):
 def _compute_cohort(mode: str):
     try:
         started = time.time()
-        with engine.connect() as conn:
-            df = _load_cohort_df(conn, mode)
-        df = _normalize_columns(df)
-
+        df = _eligible_patient_rows(mode)
+        auc = (t1_forecast or {}).get("metrics", {}).get("roc_auc") if mode == "risk" else None
         if df.empty:
-            result = {"mode": mode, "total": 0, "patients": [],
+            result = {"mode": mode, "total": 0, "patients": [], "risk_model_auc": auc,
                       "summary": {"mean_hba1c": None, "mean_forecast_hba1c": None,
-                                  "worsening": 0, "improving": 0, "levels": {k: 0 for k in _LEVEL_GROUPS}}}
+                                  "worsening": 0, "improving": 0,
+                                  "tier1_alerts": 0, "tier1_threshold": round(RISK_LOW * 100, 1),
+                                  "levels": {k: 0 for k in _LEVEL_GROUPS}}}
             _cohort_cache[mode] = (time.time(), result)
             return result
 
-        for col in ("age", "HbA1c", "glucose_fasting", "bmi", "systolic_bp", "triglycerides"):
-            df[col] = pd.to_numeric(df[col], errors="coerce") if col in df.columns else np.nan
-        if "sex" not in df.columns:
-            df["sex"] = None
-        df["patient_id"] = df["patient_id"].astype(str)
-        df = df.sort_values("test_date", kind="stable")
-
-        # Усе рахуємо векторно по всій вибірці, без циклу pandas-операцій по кожному пацієнту
-        grp = df.groupby("patient_id", sort=False)
-        back = grp.cumcount(ascending=False)          # 0 = останній візит, 1 = передостанній
-        latest = df[back == 0].set_index("patient_id")
-        ids = latest.index
-        prev = df[back == 1].set_index("patient_id").reindex(ids)
-        visits = grp.size().reindex(ids).to_numpy()
-        last_hba1c = grp["HbA1c"].last().reindex(ids)             # останнє непорожнє значення
-        last_trig = grp["triglycerides"].last().reindex(ids)
-
-        fallback = last_hba1c.where(last_hba1c.notna() & (last_hba1c != 0), 6.0)
-        hba1c_s = latest["HbA1c"].fillna(fallback)
-        prev_hba1c_s = prev["HbA1c"].fillna(hba1c_s)
-
-        # Ознаки Tier 2 враховують історію візитів, тому рахуємо їх по всій вибірці й беремо останній візит
-        predicted = _t2_predict(_t2_features(df)[(back == 0).to_numpy()])
-        probs = None
-        if mode == "risk":
-            probs = _t1_proba(latest)
-        else:
-            tail = df[back < 8]  # тренд рахується за останніми 8 візитами
-            g_trend = {pid: _trend_forecast(v / GLUCOSE_MMOL_TO_MGDL)
-                       for pid, v in tail.groupby("patient_id", sort=False)["glucose_fasting"]}
-            bp_trend = {pid: _trend_forecast(v)
-                        for pid, v in tail.groupby("patient_id", sort=False)["systolic_bp"]}
-
-        hba1c_a = hba1c_s.to_numpy(dtype=float)
-        prev_a = prev_hba1c_s.to_numpy(dtype=float)
-        glucose_a = latest["glucose_fasting"].fillna(100).to_numpy(dtype=float) / GLUCOSE_MMOL_TO_MGDL
-        bp_a = latest["systolic_bp"].fillna(120).to_numpy(dtype=float)
-        bmi_a = latest["bmi"].fillna(25).to_numpy(dtype=float)
-        age_a = latest["age"].fillna(50).to_numpy(dtype=float)
-        trig_a = last_trig.to_numpy(dtype=float)
-        sex_a = latest["sex"].tolist()
-
+        # Forecast both outcomes from the same six fully measured fields and personal horizon.
+        features = pd.DataFrame([{**{k: row[k] for k in REQUIRED_FORECAST_FIELDS},
+                                  "days_to_next_visit": row["days_to_next_visit"]}
+                                 for _, row in df.iterrows()])
+        probs = _t1_proba(features) if mode == "risk" else np.full(len(features), np.nan)
+        predicted = _t2_predict(features)
         rows = []
-        for i, pid in enumerate(ids):
-            hba1c = float(hba1c_a[i])
-            glucose = float(glucose_a[i])
+        for i, row in df.reset_index(drop=True).iterrows():
+            pid = str(row["patient_id"])
+            hba1c = float(row["HbA1c"])
+            glucose = float(row["glucose_fasting"]) / GLUCOSE_MMOL_TO_MGDL
+            bp, bmi, age = float(row["systolic_bp"]), float(row["bmi"]), int(float(row["age"]))
+            tg = float(row["triglycerides"])
             forecast = float(predicted[i])
-
             if mode == "risk":
-                level, _ = _risk_assessment(float(probs[i]), hba1c, glucose)
-                risk, risk_forecast = float(probs[i]) * 100, None
+                probability = float(probs[i])
+                level, _ = _risk_assessment(probability, hba1c, glucose)
+                risk = round(probability * 100, 1)
+                risk_forecast = None
+                tier1_alert = bool(probability >= RISK_LOW)
             else:
-                bp = float(bp_a[i])
-                gt, bt = g_trend.get(pid), bp_trend.get(pid)
-                trig = None if np.isnan(trig_a[i]) else float(trig_a[i])
                 comp = _complication_assessment(
-                    hba1c, float(prev_a[i]), glucose, bp, float(bmi_a[i]),
-                    _trig_to_mmol(trig) or 0, int(age_a[i]), forecast,
-                    gt if gt is not None else glucose,
-                    bt if bt is not None else bp)
-                level, risk, risk_forecast = comp["level"], float(comp["score"]), float(comp["forecast_score"])
-
-            sex = sex_a[i]
+                    hba1c, _num(row.get("previous_hba1c"), hba1c), glucose,
+                    bp, bmi, _trig_to_mmol(tg), age, forecast, glucose, bp)
+                level, risk = comp["level"], float(comp["score"])
+                risk_forecast = float(comp["forecast_score"])
+                tier1_alert = None
             rows.append({
-                "patient_id": pid,
-                "age": int(age_a[i]),
-                "sex": "M" if pd.isna(sex) else str(sex),
-                "visits": int(visits[i]),
+                "patient_id": pid, "age": age,
+                "sex": "M" if pd.isna(row.get("sex")) else str(row.get("sex")),
+                "visits": int(row["visits"]),
+                "next_visit_date": str(row["next_visit_date"]),
+                "days_to_next_visit": int(row["days_to_next_visit"]),
                 "hba1c": round(hba1c, 2),
                 "forecast_hba1c": round(forecast, 2),
                 "delta": round(forecast - hba1c, 2),
                 "risk": round(risk, 1),
+                "tier1_probability": (round(float(probs[i]) * 100, 1)
+                                      if mode == "risk" and np.isfinite(probs[i]) else None),
+                "tier1_alert": tier1_alert,
                 "risk_forecast": None if risk_forecast is None else round(risk_forecast, 1),
-                "level": level,
-                "group": _risk_group(level),
+                "level": level, "group": _risk_group(level),
             })
 
         # Спочатку за рівнем (лабораторні критерії можуть підвищити рівень над ML-відсотком), потім за відсотком
-        rank = {"Високий": 2, "Помірний": 1, "Низький": 0}
-        rows.sort(key=lambda r: (rank[r["group"]], r["risk"]), reverse=True)
+        rank = {"Високий": 2, "Помірний": 1, "Низький": 0,
+                "Недостатньо даних": -1, "Модель не пройшла перевірку": -2}
+        rows.sort(key=lambda r: (rank[r["group"]], r["risk"] or 0), reverse=True)
         n = len(rows)
         result = {
             "mode": mode,
             "total": n,
+            "risk_model_auc": auc,
             "summary": {
                 "mean_hba1c": round(sum(r["hba1c"] for r in rows) / n, 2),
                 "mean_forecast_hba1c": round(sum(r["forecast_hba1c"] for r in rows) / n, 2),
                 "worsening": sum(r["delta"] > 0.2 for r in rows),
                 "improving": sum(r["delta"] < -0.2 for r in rows),
+                "tier1_alerts": sum(r["tier1_alert"] is True for r in rows),
+                "tier1_threshold": round(RISK_LOW * 100, 1),
                 "levels": {k: sum(r["group"] == k for r in rows) for k in _LEVEL_GROUPS},
             },
             "patients": rows,

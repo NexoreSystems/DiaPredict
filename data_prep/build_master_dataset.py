@@ -1,59 +1,63 @@
-import os
+"""Build encounter-level records from observed source data without filling gaps."""
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
 
-DATA_DIR = r"C:\Users\Admin\OneDrive\Рабочий стол\Dowload_datasets"
 
-print("1/5 Loading source files...")
-df_patients = pd.read_csv(os.path.join(DATA_DIR, "patients.csv"))
-df_labs = pd.read_csv(os.path.join(DATA_DIR, "lab_results.csv"))
+BASE_DIR = Path(__file__).resolve().parents[1]
+RAW_DIR = BASE_DIR / "data_raw"
+OUTPUT_FILE = BASE_DIR / "diabetes_master_longitudinal.csv"
+CHUNK_SIZE = 500_000
 
-print(f"Loaded: {len(df_patients)} patients, {len(df_labs)} lab results.")
 
-# 2. Filter patients with >= 180 days history
-print("\n2/5 Filtering longitudinal data (>= 180 days span)...")
-df_labs['test_date'] = pd.to_datetime(df_labs['test_date'])
+def build_master_dataset() -> pd.DataFrame:
+    """Return one row per observed patient encounter, preserving missing labs as NaN.
 
-patient_history = df_labs.groupby('patient_id')['test_date'].agg(['min', 'max', 'count'])
-patient_history['days_span'] = (patient_history['max'] - patient_history['min']).dt.days
+    Blood pressure and BMI come from the patient profile and are therefore
+    patient-level covariates, not longitudinal measurements. No forward/backward
+    fill is performed on any lab result.
+    """
+    patients = pd.read_csv(RAW_DIR / "patients.csv")
+    patients["patient_id"] = patients["patient_id"].astype(str)
 
-valid_patients = patient_history[(patient_history['days_span'] >= 180) & (patient_history['count'] >= 3)].index
-print(f"Found {len(valid_patients)} patients with >= 180 days history.")
+    encounter_parts = []
+    lab_parts = []
+    usecols = ["patient_id", "test_date", "test_name", "value"]
+    for chunk in pd.read_csv(RAW_DIR / "lab_results.csv", usecols=usecols, chunksize=CHUNK_SIZE):
+        chunk["patient_id"] = chunk["patient_id"].astype(str)
+        chunk["test_date"] = pd.to_datetime(chunk["test_date"], errors="coerce")
+        chunk = chunk.dropna(subset=["patient_id", "test_date"])
+        encounter_parts.append(chunk[["patient_id", "test_date"]].drop_duplicates())
+        lab_parts.append(chunk[chunk["test_name"].isin({"HbA1c", "glucose_fasting", "triglycerides"})])
 
-df_labs_filtered = df_labs[df_labs['patient_id'].isin(valid_patients)].copy()
+    encounters = pd.concat(encounter_parts, ignore_index=True).drop_duplicates()
+    labs = pd.concat(lab_parts, ignore_index=True)
+    observed_labs = labs.pivot_table(
+        index=["patient_id", "test_date"],
+        columns="test_name",
+        values="value",
+        aggfunc="mean",
+    ).reset_index()
+    observed_labs.columns.name = None
 
-# 3. Pivot laboratory tests
-print("\n3/5 Pivoting lab tests into feature columns...")
-df_labs_pivot = df_labs_filtered.pivot_table(
-    index=['patient_id', 'test_date'],
-    columns='test_name',
-    values='value',
-    aggfunc='mean'
-).reset_index()
+    # Keep every actual lab encounter in chronological history, including visits
+    # where one or more of the three model lab measurements were not taken.
+    master = encounters.merge(observed_labs, on=["patient_id", "test_date"], how="left")
+    master = master.merge(patients, on="patient_id", how="left", validate="many_to_one")
+    master = master.sort_values(["patient_id", "test_date"], kind="stable").reset_index(drop=True)
+    return master
 
-df_labs_pivot.columns.name = None
 
-# 4. Merge with demographics
-print("\n4/5 Merging with patient demographics...")
-master_df = df_labs_pivot.merge(df_patients, on='patient_id', how='left')
-master_df = master_df.sort_values(by=['patient_id', 'test_date']).reset_index(drop=True)
+def main() -> None:
+    master = build_master_dataset()
+    master.to_csv(OUTPUT_FILE, index=False)
+    print(f"Saved observed encounter data: {OUTPUT_FILE}")
+    print(f"Rows: {len(master):,}; patients: {master['patient_id'].nunique():,}")
+    for field in ("HbA1c", "glucose_fasting", "triglycerides"):
+        coverage = master[field].notna().mean() * 100 if field in master else 0
+        print(f"{field} observed on {coverage:.1f}% of encounter rows")
+    print("No missing laboratory values were filled.")
 
-# 5. Forward fill missing lab values per patient (handling NaNs in time-series)
-print("\n5/5 Propagating missing lab values (Forward Fill)...")
-lab_cols = ['HbA1c', 'glucose_fasting', 'BMI', 'systolic_bp', 'diastolic_bp', 'eGFR', 'creatinine', 'HDL', 'LDL']
-lab_cols_existing = [c for c in lab_cols if c in master_df.columns]
 
-# Forward fill within each patient's timeline
-master_df[lab_cols_existing] = master_df.groupby('patient_id')[lab_cols_existing].ffill().bfill()
-
-# Save final dataset
-output_file = os.path.join(DATA_DIR, "diabetes_master_longitudinal.csv")
-master_df.to_csv(output_file, index=False)
-
-print("\n==========================================")
-print(f"SUCCESSFULLY CREATED: {output_file}")
-print(f"Total Rows: {len(master_df)}")
-print(f"Unique Patients: {master_df['patient_id'].nunique()}")
-print("\nFirst 3 rows preview:")
-print(master_df[['patient_id', 'test_date', 'HbA1c', 'glucose_fasting', 'age', 'dx_type2_diabetes']].head(3))
-print("==========================================")
+if __name__ == "__main__":
+    main()
